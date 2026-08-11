@@ -36,29 +36,39 @@ The escrow contract holds funds in trust during agent-mediated purchases, releas
 
 #### Key Functions
 
-- `lock_funds(order_id, amount, buyer, merchant)`: Lock funds for an order
-- `release_funds(order_id)`: Release funds to merchant
-- `refund_funds(order_id)`: Refund funds to buyer
-- `get_balance(order_id)`: Get locked balance for an order
-- `get_status(order_id)`: Get escrow status
+- `create(escrow_id, buyer, seller, token)`: Create an unfunded escrow record in `Created` status
+- `deposit(...)` / `fund(...)`: Lock buyer funds for an order
+- `release(escrow_id)` / `partial_release(...)`: Transfer remaining/partial balance to seller
+- `refund(escrow_id)`: Return funds to buyer (after timeout if needed)
+- `dispute(escrow_id)` / `resolve_dispute(...)` / `resolve_dispute_quorum(...)`: Dispute lifecycle
+- `cancel(escrow_id)`: Merchant cancels an unfunded escrow
+- `get_escrow(escrow_id)`: Get full escrow record
+- `get_receipt(escrow_id)` / `get_merchant_receipt(...)`: Buyer/seller receipts
+- `get_release_eligibility(...)` / `get_refund_eligibility(...)` / `get_timeout_view(...)`: Read-only eligibility checks
+- Admin: `set_limits`, `update_fee`, `add_token`, `set_create_paused`, `propose_admin`, `accept_admin`, `add_co_admin`
 
 #### State
 
 ```rust
-struct EscrowState {
-    order_id: Bytes,
+struct EscrowRecord {
+    escrow_id: BytesN<32>,
     buyer: Address,
-    merchant: Address,
+    seller: Address,
+    token: Address,
     amount: i128,
+    fee_bps: u32,
     status: EscrowStatus,
-    created_at: u64,
-    time_lock: u64,
+    timeout_ledger: u32,
+    dispute_reason: Option<Symbol>,
+    create_paused: bool,
 }
 
 enum EscrowStatus {
-    Locked,
+    Created,
+    Funded,
     Released,
     Refunded,
+    Cancelled,
     Disputed,
 }
 ```
@@ -68,7 +78,7 @@ enum EscrowStatus {
 - Buyer approves purchase → funds locked in escrow
 - Delivery confirmed → funds released to merchant
 - Delivery failed → funds refunded to buyer
-- Dispute → funds held until resolution
+- Dispute → funds held until resolution (admin or arbiter quorum)
 
 ### Permissions Contract
 
@@ -80,31 +90,53 @@ The permissions contract manages delegated spending authority, allowing users to
 
 #### Key Functions
 
-- `grant_permission(delegator, delegate, limit, expiry)`: Grant spending permission
-- `revoke_permission(delegator, delegate)`: Revoke spending permission
-- `check_permission(delegator, delegate, amount)`: Check if amount is within limit
-- `get_permission(delegator, delegate)`: Get permission details
-- `update_limit(delegator, delegate, new_limit)`: Update spending limit
+- `grant(owner, delegate, ...)`: Grant spending permission
+- `grant_child(owner, delegate, ...)`: Derive a nested permission from an existing grant
+- `revoke(owner, delegate)`: Revoke spending permission
+- `transfer_permission(owner, ...)`: Transfer a permission to another account
+- `can_spend(owner, delegate, amount)`: Check if amount is within limit
+- `execute_spend(owner, delegate, ...)`: Spend within limits (emits `PermissionSpendEvent`)
+- `get_permission(owner, delegate)`: Get permission details
+- `increase_allowance(...)` / `decrease_allowance(...)`: Adjust spending limit
+- `renew_permission(...)` / `update_expiry(...)`: Manage expiry
+- `execute_spend_via_relayer(...)`: Gasless spend via relayer signature
+- `grant_multi_owner(...)`: Multi-owner (quorum) grants
+- `pause(...)` / `resume(...)` / `pause_grants(...)`: Pause controls
+- `set_admin(...)` / `propose_admin(...)` / `accept_admin(...)`: Admin management
 
 #### State
 
 ```rust
-struct Permission {
-    delegator: Address,
+struct PermissionRecord {
     delegate: Address,
-    limit: i128,
-    spent: i128,
+    limit_per_transaction: i128,
+    limit_total: i128,
+    used: i128,
     expiry: u64,
-    created_at: u64,
+    status: PermissionStatus,
 }
 ```
 
 #### Use Cases
 
 - User creates delegation → permission granted to agent
-- Agent attempts payment → permission checked
+- Agent attempts payment → permission checked (`can_spend`)
 - Spending limit reached → payment blocked
 - User revokes delegation → permission revoked
+
+### Delegation Registry Contract
+
+**On-chain State**: Delegation records
+
+#### Purpose
+
+Tracks delegation records with expiry and versioned rollback/upgrade support.
+
+#### Key Functions
+
+- Register and update delegation records
+- Read delegation state for off-chain services
+- Versioned rollback of delegation state
 
 ### Reputation Contract (Planned)
 
@@ -112,40 +144,10 @@ struct Permission {
 
 #### Purpose
 
-The reputation contract tracks on-chain reputation scores for merchants and agents, enabling trust-based decision making.
-
-#### Key Functions
+The reputation contract will track on-chain reputation scores for merchants and agents, enabling trust-based decision making.
 
 - `record_transaction(merchant, amount, rating)`: Record transaction and rating
 - `get_reputation(entity)`: Get reputation score
-- `update_reputation(entity, score)`: Update reputation score
-- `get_transaction_history(entity)`: Get transaction history
-
-#### State
-
-```rust
-struct Reputation {
-    entity: Address,
-    score: i128,
-    transaction_count: u64,
-    total_amount: i128,
-    average_rating: i128,
-}
-
-struct Transaction {
-    entity: Address,
-    amount: i128,
-    rating: i128,
-    timestamp: u64,
-}
-```
-
-#### Use Cases
-
-- Merchant completes order → reputation updated
-- User rates merchant → rating recorded
-- Agent selects merchant → reputation considered
-- Reputation threshold → merchant eligibility
 
 ### Marketplace Contract (Planned)
 
@@ -153,35 +155,10 @@ struct Transaction {
 
 #### Purpose
 
-The marketplace contract maintains a registry of merchants and anchors, enabling discovery and verification of trusted merchants.
-
-#### Key Functions
+The marketplace contract will maintain a registry of merchants and anchors, enabling discovery and verification of trusted merchants.
 
 - `register_merchant(merchant, metadata)`: Register merchant
 - `verify_merchant(merchant)`: Verify merchant
-- `get_merchant(merchant)`: Get merchant details
-- `list_merchants(criteria)`: List merchants by criteria
-- `update_merchant(merchant, metadata)`: Update merchant metadata
-
-#### State
-
-```rust
-struct Merchant {
-    address: Address,
-    name: String,
-    metadata: Bytes,
-    verified: bool,
-    reputation: Address, // Reference to reputation contract
-    registered_at: u64,
-}
-```
-
-#### Use Cases
-
-- Merchant registers → added to registry
-- Merchant verified → verification status updated
-- User searches marketplace → merchant list returned
-- Merchant updates info → metadata updated
 
 ## On-Chain vs Off-Chain
 
@@ -191,8 +168,9 @@ Trust-critical operations that require blockchain guarantees:
 
 - **Escrow**: Fund locking and release
 - **Permissions**: Spending authority delegation
-- **Reputation**: Reputation score tracking
-- **Marketplace**: Merchant registry and verification
+- **Delegation Registry**: Delegation records with expiry and rollback
+- **Reputation** (planned): Reputation score tracking
+- **Marketplace** (planned): Merchant registry and verification
 
 ### Off-Chain (Services)
 
@@ -219,10 +197,10 @@ Contracts can call other contracts:
 
 ```rust
 // Escrow contract calling Permissions contract
-let permission = permissions::check_permission(
+let allowed = permissions::can_spend(
     &e,
-    &buyer,
-    &agent,
+    &owner,
+    &delegate,
     &amount
 );
 ```
@@ -478,12 +456,12 @@ fn fuzz_lock_funds() {
 
 ### Testnet Deployment
 
-Deploy contracts to Stellar testnet:
+Deploy contracts to the Stellar testnet:
 
 ```bash
 soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/escrow.wasm \
-  --source alice \
+  --wasm target/wasm32-unknown-unknown/release/delego_escrow.wasm \
+  --source <DEPLOYER_ADDRESS> \
   --network testnet
 ```
 
@@ -493,9 +471,9 @@ Deploy contracts to Stellar mainnet:
 
 ```bash
 soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/escrow.wasm \
-  --source alice \
-  --network mainnet
+  --wasm target/wasm32-unknown-unknown/release/delego_escrow.wasm \
+  --source <DEPLOYER_ADDRESS> \
+  --network public
 ```
 
 ### Verification
@@ -504,7 +482,7 @@ Verify contract deployment:
 
 ```bash
 soroban contract inspect \
-  --contract-id <contract-id> \
+  --id <contract-id> \
   --network testnet
 ```
 
@@ -527,7 +505,7 @@ Query contract state:
 ```bash
 soroban contract invoke \
   --id <contract-id> \
-  --fn get_balance \
+  --fn get_escrow \
   --arg <order-id> \
   --network testnet
 ```
@@ -543,7 +521,7 @@ Track contract analytics:
 
 ## Documentation
 
-See [contracts/README.md](../../contracts/README.md) for detailed contract documentation including:
+See the repository [README.md](../../README.md) for detailed contract documentation including:
 
 - Contract implementation details
 - Development setup
@@ -553,4 +531,4 @@ See [contracts/README.md](../../contracts/README.md) for detailed contract docum
 
 ---
 
-**Last Updated**: June 2026
+**Last Updated**: August 2026

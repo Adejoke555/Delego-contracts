@@ -22,9 +22,8 @@ labels: bug
 ## Environment
 
 - OS:
-- Node version:
-- pnpm version:
-- Service / app affected:
+- Rust version (`rustc --version`):
+- Contract / revision affected:
 
 ## Logs / screenshots
 

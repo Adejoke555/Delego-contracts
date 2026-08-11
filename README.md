@@ -20,7 +20,7 @@ Delego is split across three repositories:
 
 | Repository | Purpose |
 |---|---|
-| [Delego](https://github.com/DelegoLabs/Delego) | Frontend web application (`apps/frontend`) |
+| [Delego](https://github.com/DelegoLabs/Delego) | Frontend web application |
 | [Delego-backend](https://github.com/DelegoLabs/Delego-backend) | Backend microservices, agents, shared SDK/types |
 | [Delego-contracts](https://github.com/DelegoLabs/Delego-contracts) | **This repo** — Soroban smart contracts |
 
@@ -45,7 +45,7 @@ Delego (web)  ──>  Delego-backend (API/gateway)  ──>  Soroban RPC  ─�
 | Delegation Registry | [`delegation_registry/`](./delegation_registry) | Tracks delegations, expiry, versioned rollback/upgrade |
 | Cross-contract tests | [`tests/`](./tests) | End-to-end delegated purchase flows across escrow + permissions |
 
-Each contract is a Cargo workspace member. Integration tests live alongside each contract under `*/tests/` and as `#[cfg(test)]` modules in `*/src/`.
+Each contract is a Cargo workspace member. Unit tests live as `#[cfg(test)]` modules in `*/src/test.rs`, contract-level integration tests as modules in `*/src/integration_tests.rs`, and cross-contract integration tests in the root `tests/` package.
 
 ## 🛠️ Prerequisites
 
@@ -97,11 +97,13 @@ Build artifacts land in `target/wasm32-unknown-unknown/release/`.
 ### Testnet
 
 ```bash
-soroban network futurenet
+soroban network add --global futurenet \
+  --rpc-url https://rpc-futurenet.stellar.org \
+  --network-passphrase "Test SDF Future Network ; September 2022"
 
 soroban contract deploy \
   --wasm target/wasm32-unknown-unknown/release/delego_escrow.wasm \
-  --source <DEPLOYER_ADDRESS> \
+  --source <DEPLOYER_ACCOUNT> \
   --network futurenet
 
 export ESCROW_CONTRACT_ID=<CONTRACT_ID>
@@ -110,11 +112,13 @@ export ESCROW_CONTRACT_ID=<CONTRACT_ID>
 ### Mainnet
 
 ```bash
-soroban network public
+soroban network add --global public \
+  --rpc-url https://soroban-rpc.stellar.org \
+  --network-passphrase "Public Global Stellar Network ; September 2015"
 
 soroban contract deploy \
   --wasm target/wasm32-unknown-unknown/release/delego_escrow.wasm \
-  --source <DEPLOYER_ADDRESS> \
+  --source <DEPLOYER_ACCOUNT> \
   --network public
 ```
 

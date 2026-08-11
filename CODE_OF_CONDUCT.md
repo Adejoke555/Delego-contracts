@@ -107,8 +107,8 @@ Community Impact Guidelines were inspired by [Mozilla's code of conduct enforcem
 If you have questions about this Code of Conduct or need to report a violation:
 
 - **Email**: conduct@delego.dev
-- **GitHub Issues**: https://github.com/your-org/delego/issues
+- **GitHub Issues**: https://github.com/DelegoLabs/Delego-contracts/issues
 
 ---
 
-**Last Updated**: June 2026
+**Last Updated**: August 2026

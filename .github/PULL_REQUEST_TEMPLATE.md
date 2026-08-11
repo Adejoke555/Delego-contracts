@@ -11,8 +11,9 @@
 
 ## Test plan
 
-- [ ] `pnpm typecheck`
-- [ ] `pnpm test`
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo test --workspace`
 - [ ] Manual testing (describe):
 
 ## Checklist

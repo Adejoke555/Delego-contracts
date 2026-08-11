@@ -162,7 +162,7 @@ pub struct EscrowCancelledEvent {
 ## Development
 
 ```bash
-cd contracts/escrow
+cd escrow
 
 # Run all tests
 cargo test
