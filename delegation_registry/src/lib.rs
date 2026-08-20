@@ -128,6 +128,13 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .expect("Admin not set")
+    }
+
     pub fn create_delegation(
         env: Env,
         owner: Address,
