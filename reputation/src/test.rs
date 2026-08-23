@@ -360,6 +360,20 @@ fn test_score_bounded_to_recent_window() {
     // The old disputes have fully aged out of the SCORE_WINDOW most-recent
     // records feeding the score, so the score reflects only the clean run.
     assert_eq!(rep.score, 10_000);
+
+    // One more dispute lands inside the window, so it now counts against the
+    // score. This pins the boundary: the window, not the dispute count, is
+    // what excluded the earlier ones.
+    client.record_transaction(
+        &admin,
+        &(10 + crate::SCORE_WINDOW as u64),
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    let rep = client.get_reputation(&entity);
+    assert!(rep.score < 10_000);
 }
 
 // --- rate_entity ---
@@ -383,6 +397,37 @@ fn test_rate_entity_happy_path() {
 
     let breakdown = client.get_reputation_breakdown(&entity, &0u32, &10u32);
     assert_eq!(breakdown.get(0).unwrap().rating, Some(9000u32));
+}
+
+#[test]
+fn test_rate_entity_updates_avg_rating() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Reach min_transactions_threshold (5) so the score/avg_rating are
+    // visible on get_reputation.
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    // Only two of the five are rated; avg_rating must reflect only those,
+    // not all five recorded transactions.
+    client.rate_entity(&counterparty, &0u64, &entity, &8000u32);
+    client.rate_entity(&counterparty, &1u64, &entity, &10_000u32);
+
+    let rep = client.get_reputation(&entity);
+    // All five records are equally fresh (same recorded_at), so the two
+    // ratings carry equal weight: (8000 + 10000) / 2.
+    assert_eq!(rep.avg_rating, 9000);
 }
 
 #[test]

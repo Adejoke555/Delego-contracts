@@ -161,6 +161,10 @@ pub enum DataKey {
     Flags(Address),
     FrozenStatus(Address),
     RatedEscrows(Address),
+    /// `true` once `.1` has appeared as a `counterparty` on one of `.0`'s
+    /// recorded transactions. Backs an O(1) [`ReputationContract::has_transacted_with`]
+    /// check instead of scanning `TransactionHistory`.
+    Transacted(Address, Address),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -311,6 +315,10 @@ impl ReputationContract {
                 .unwrap_or_else(|| Vec::new(&env));
             history.push_back(escrow_id);
             env.storage().persistent().set(&hist_key, &history);
+            env.storage().persistent().set(
+                &DataKey::Transacted(entity.clone(), record.counterparty.clone()),
+                &true,
+            );
             Self::apply_new_transaction_counts(&env, &entity, &outcome);
         } else if let Some(prior) = &existing {
             Self::apply_outcome_change_counts(&env, &entity, &prior.outcome, &outcome);
@@ -708,27 +716,20 @@ impl ReputationContract {
         Ok(())
     }
 
-    /// Returns `true` if `counterparty` appears on at least one of
+    /// Returns `true` if `counterparty` has appeared on at least one of
     /// `entity`'s recorded transactions. Used to gate [`Self::flag_entity`]
     /// so only genuine counterparties (or the admin) can report an entity.
+    ///
+    /// This is an O(1) lookup against `DataKey::Transacted`, written once
+    /// per new escrow in `record_transaction` — not a scan over
+    /// `TransactionHistory`, which would make `flag_entity`'s cost grow with
+    /// the entity's lifetime transaction count (the same unbounded-growth
+    /// problem `SCORE_WINDOW` guards against in `recompute_score`).
     fn has_transacted_with(env: &Env, entity: &Address, counterparty: &Address) -> bool {
-        let history: Vec<u64> = env
-            .storage()
+        env.storage()
             .persistent()
-            .get(&DataKey::TransactionHistory(entity.clone()))
-            .unwrap_or_else(|| Vec::new(env));
-        for escrow_id in history.iter() {
-            let record: Option<TransactionRecord> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::TransactionRecord(escrow_id));
-            if let Some(record) = record {
-                if record.counterparty == *counterparty {
-                    return true;
-                }
-            }
-        }
-        false
+            .get(&DataKey::Transacted(entity.clone(), counterparty.clone()))
+            .unwrap_or(false)
     }
 
     fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
