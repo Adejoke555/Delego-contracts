@@ -77,6 +77,11 @@ pub struct ReputationConfig {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ReputationError {
+    /// Reserved for API/ABI compatibility with issue #18's error contract.
+    /// Unreachable in normal operation: initialization now happens via
+    /// `__constructor` (see [`ReputationContract::__constructor`]), which
+    /// the host guarantees can run at most once, atomically with
+    /// deployment — there is no second call for this to guard against.
     AlreadyInitialized = 1,
     NotInitialized = 2,
     Unauthorized = 3,
@@ -219,19 +224,29 @@ pub struct ReputationContract;
 impl ReputationContract {
     // --- Initialization ---
 
-    pub fn initialize(
+    /// Sets the admin and config. This is a Soroban *constructor*: the host
+    /// invokes it exactly once, atomically with contract deployment (see
+    /// `env.register(ReputationContract, (admin, config))`), and rejects any
+    /// later attempt to call it directly.
+    ///
+    /// A plain post-deploy `initialize(...)` function — as used elsewhere in
+    /// this workspace (`escrow`, `permissions`, `delegation_registry`) —
+    /// leaves a window between deployment and initialization where anyone
+    /// can call it first and self-authorize as `admin`, since `admin` is
+    /// itself just a caller-supplied parameter and `require_auth()` on it
+    /// only proves the caller controls *some* address, not that they're the
+    /// intended deployer. Making initialization part of deployment itself
+    /// closes that window entirely for this contract.
+    pub fn __constructor(
         env: Env,
         admin: Address,
         config: ReputationConfig,
-    ) -> Result<bool, ReputationError> {
-        if env.storage().instance().has(&DataKey::Admin) {
-            return Err(ReputationError::AlreadyInitialized);
-        }
+    ) -> Result<(), ReputationError> {
         Self::validate_config(&config)?;
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Config, &config);
-        Ok(true)
+        Ok(())
     }
 
     // --- Core Recording ---

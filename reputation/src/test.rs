@@ -22,10 +22,9 @@ fn default_config() -> ReputationConfig {
 
 fn setup(env: &Env) -> (ReputationContractClient<'_>, Address) {
     env.mock_all_auths();
-    let contract_id = env.register(ReputationContract, ());
-    let client = ReputationContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
-    client.initialize(&admin, &default_config());
+    let contract_id = env.register(ReputationContract, (admin.clone(), default_config()));
+    let client = ReputationContractClient::new(env, &contract_id);
     (client, admin)
 }
 
@@ -35,58 +34,54 @@ fn advance_time(env: &Env, seconds: u64) {
     });
 }
 
-// --- initialize ---
+// --- constructor (deployment-time initialization) ---
+//
+// `__constructor` is a Soroban constructor: the host runs it exactly once,
+// atomically with `env.register`, and there is no way to invoke it again
+// afterward (unlike the plain `initialize()` pattern used elsewhere in this
+// workspace) — so there is no "already initialized" or "not yet
+// initialized" state to exercise here, only deployment succeeding or
+// `env.register` panicking on an invalid config.
 
 #[test]
-fn test_initialize() {
+fn test_constructor_sets_admin_and_config() {
     let env = Env::default();
-    let (client, admin) = setup(&env);
+    let (client, _admin) = setup(&env);
 
     assert_eq!(client.get_config(), default_config());
-
-    let res = client.try_initialize(&admin, &default_config());
-    assert_eq!(res, Err(Ok(ReputationError::AlreadyInitialized)));
 }
 
 #[test]
-fn test_initialize_rejects_invalid_config() {
+#[should_panic]
+fn test_constructor_rejects_zero_decay_window() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(ReputationContract, ());
-    let client = ReputationContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-
     let mut bad = default_config();
     bad.decay_window_seconds = 0;
-    assert_eq!(
-        client.try_initialize(&admin, &bad),
-        Err(Ok(ReputationError::InvalidParam))
-    );
-
-    let mut bad = default_config();
-    bad.dispute_penalty_bps = 10_001;
-    assert_eq!(
-        client.try_initialize(&admin, &bad),
-        Err(Ok(ReputationError::InvalidParam))
-    );
-
-    let mut bad = default_config();
-    bad.freeze_threshold_flags = 0;
-    assert_eq!(
-        client.try_initialize(&admin, &bad),
-        Err(Ok(ReputationError::InvalidParam))
-    );
+    env.register(ReputationContract, (admin, bad));
 }
 
 #[test]
-fn test_get_config_before_init_fails() {
+#[should_panic]
+fn test_constructor_rejects_dispute_penalty_over_max() {
     let env = Env::default();
-    let contract_id = env.register(ReputationContract, ());
-    let client = ReputationContractClient::new(&env, &contract_id);
-    assert_eq!(
-        client.try_get_config(),
-        Err(Ok(ReputationError::NotInitialized))
-    );
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut bad = default_config();
+    bad.dispute_penalty_bps = 10_001;
+    env.register(ReputationContract, (admin, bad));
+}
+
+#[test]
+#[should_panic]
+fn test_constructor_rejects_zero_freeze_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut bad = default_config();
+    bad.freeze_threshold_flags = 0;
+    env.register(ReputationContract, (admin, bad));
 }
 
 // --- record_transaction ---

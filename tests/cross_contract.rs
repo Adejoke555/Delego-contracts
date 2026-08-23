@@ -196,17 +196,19 @@ fn test_reputation_recorded_after_escrow_release() {
     let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
 
     let reputation_admin = Address::generate(&t.env);
-    let reputation_contract_id = t.env.register(ReputationContract, ());
-    let reputation_client = ReputationContractClient::new(&t.env, &reputation_contract_id);
-    reputation_client.initialize(
-        &reputation_admin,
-        &ReputationConfig {
-            decay_window_seconds: 90 * 24 * 60 * 60,
-            min_transactions_threshold: 1,
-            dispute_penalty_bps: 500,
-            freeze_threshold_flags: 3,
-        },
+    let reputation_contract_id = t.env.register(
+        ReputationContract,
+        (
+            reputation_admin.clone(),
+            ReputationConfig {
+                decay_window_seconds: 90 * 24 * 60 * 60,
+                min_transactions_threshold: 1,
+                dispute_penalty_bps: 500,
+                freeze_threshold_flags: 3,
+            },
+        ),
     );
+    let reputation_client = ReputationContractClient::new(&t.env, &reputation_contract_id);
 
     let limit_total = 1000i128;
     let limit_per_tx = 500i128;
