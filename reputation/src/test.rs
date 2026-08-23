@@ -179,6 +179,50 @@ fn test_record_transaction_rejects_frozen_entity() {
 }
 
 #[test]
+fn test_record_transaction_allows_lifecycle_update_while_frozen() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    client.freeze_entity(&admin, &entity);
+
+    // A dispute opened before the freeze must still be able to resolve —
+    // only brand-new escrows are rejected while frozen.
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::ResolvedSeller,
+    );
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.disputed_transactions, 0);
+    assert_eq!(rep.successful_transactions, 1);
+
+    // A genuinely new escrow is still rejected while frozen.
+    let res = client.try_record_transaction(
+        &admin,
+        &2u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+    assert_eq!(res, Err(Ok(ReputationError::EntityFrozen)));
+}
+
+#[test]
 fn test_record_transaction_same_escrow_updates_in_place() {
     let env = Env::default();
     let (client, admin) = setup(&env);
@@ -282,6 +326,45 @@ fn test_score_decays_over_time() {
     );
     let decayed = client.get_reputation(&entity);
     assert!(decayed.score < fresh.score);
+}
+
+#[test]
+fn test_score_bounded_to_recent_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Old disputes that should age out of the score window once more than
+    // SCORE_WINDOW clean transactions have been recorded since.
+    for i in 0..10u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Disputed,
+        );
+    }
+    for i in 10..(10 + crate::SCORE_WINDOW as u64) {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    // Lifetime counts remain exact regardless of the scoring window.
+    assert_eq!(rep.total_transactions, 10 + crate::SCORE_WINDOW as u64);
+    assert_eq!(rep.disputed_transactions, 10);
+    // The old disputes have fully aged out of the SCORE_WINDOW most-recent
+    // records feeding the score, so the score reflects only the clean run.
+    assert_eq!(rep.score, 10_000);
 }
 
 // --- rate_entity ---
@@ -468,12 +551,32 @@ fn test_get_reputation_breakdown_pagination() {
 
 // --- flagging ---
 
+/// Establishes `reporter` as a genuine counterparty of `entity` via a
+/// completed transaction, satisfying `flag_entity`'s reporter gate.
+fn make_transacting_counterparty(
+    client: &ReputationContractClient,
+    admin: &Address,
+    entity: &Address,
+    reporter: &Address,
+    escrow_id: u64,
+) {
+    client.record_transaction(
+        admin,
+        &escrow_id,
+        entity,
+        reporter,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+}
+
 #[test]
 fn test_flag_entity_happy_path() {
     let env = Env::default();
-    let (client, _admin) = setup(&env);
+    let (client, admin) = setup(&env);
     let entity = Address::generate(&env);
     let reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
 
     client.flag_entity(
         &reporter,
@@ -489,11 +592,35 @@ fn test_flag_entity_happy_path() {
 }
 
 #[test]
-fn test_flag_entity_same_reporter_rejected_while_active() {
+fn test_flag_entity_rejects_non_counterparty_non_admin() {
     let env = Env::default();
     let (client, _admin) = setup(&env);
     let entity = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    let res = client.try_flag_entity(&stranger, &entity, &symbol_short!("fraud"), &None);
+    assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
+}
+
+#[test]
+fn test_flag_entity_allows_admin_without_transaction() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    client.flag_entity(&admin, &entity, &symbol_short!("fraud"), &None);
+
+    let flags = client.get_flags(&entity, &0u32, &10u32);
+    assert_eq!(flags.len(), 1);
+}
+
+#[test]
+fn test_flag_entity_same_reporter_rejected_while_active() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
     let reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
 
     client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
 
@@ -504,11 +631,12 @@ fn test_flag_entity_same_reporter_rejected_while_active() {
 #[test]
 fn test_flag_entity_auto_freezes_at_threshold() {
     let env = Env::default();
-    let (client, _admin) = setup(&env);
+    let (client, admin) = setup(&env);
     let entity = Address::generate(&env);
 
-    for _ in 0..3u32 {
+    for i in 0..3u64 {
         let reporter = Address::generate(&env);
+        make_transacting_counterparty(&client, &admin, &entity, &reporter, i);
         client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
     }
 
@@ -521,6 +649,7 @@ fn test_resolve_flag_happy_path() {
     let (client, admin) = setup(&env);
     let entity = Address::generate(&env);
     let reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
 
     client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
     client.resolve_flag(&admin, &reporter, &entity);
@@ -537,10 +666,11 @@ fn test_resolve_flag_happy_path() {
 #[test]
 fn test_resolve_flag_unauthorized() {
     let env = Env::default();
-    let (client, _admin) = setup(&env);
+    let (client, admin) = setup(&env);
     let entity = Address::generate(&env);
     let reporter = Address::generate(&env);
     let not_admin = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
 
     client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
 

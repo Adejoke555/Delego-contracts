@@ -167,6 +167,12 @@ const BPS_SCALE: i128 = 10_000;
 /// avoid needless iteration.
 const MAX_HALVINGS: u64 = 20;
 
+/// Caps how many of an entity's most recent transactions feed the
+/// time-decayed score/avg_rating computation in [`ReputationContract::recompute_score`],
+/// so `record_transaction` and `rate_entity` stay bounded-cost regardless of
+/// how large an entity's lifetime history grows.
+const SCORE_WINDOW: u32 = 200;
+
 /// Maps a transaction outcome to its contribution toward `score`, in basis
 /// points, per the reputation score formula.
 fn outcome_value_bps(outcome: &TransactionOutcome) -> i128 {
@@ -254,9 +260,6 @@ impl ReputationContract {
         if caller != admin {
             return Err(ReputationError::Unauthorized);
         }
-        if Self::is_frozen(env.clone(), entity.clone()) {
-            return Err(ReputationError::EntityFrozen);
-        }
 
         let record_key = DataKey::TransactionRecord(escrow_id);
         let existing: Option<TransactionRecord> = env.storage().persistent().get(&record_key);
@@ -264,6 +267,13 @@ impl ReputationContract {
             if prior.entity != entity {
                 return Err(ReputationError::InvalidParam);
             }
+        } else if Self::is_frozen(env.clone(), entity.clone()) {
+            // Only reject brand-new escrows for a frozen entity — a
+            // lifecycle update to an escrow already on file (e.g. `Disputed`
+            // followed later by `ResolvedSeller`) must still be allowed to
+            // land, otherwise a dispute recorded before a freeze could never
+            // resolve and its penalty would outlive the freeze.
+            return Err(ReputationError::EntityFrozen);
         }
 
         let record = TransactionRecord {
@@ -286,9 +296,12 @@ impl ReputationContract {
                 .unwrap_or_else(|| Vec::new(&env));
             history.push_back(escrow_id);
             env.storage().persistent().set(&hist_key, &history);
+            Self::apply_new_transaction_counts(&env, &entity, &outcome);
+        } else if let Some(prior) = &existing {
+            Self::apply_outcome_change_counts(&env, &entity, &prior.outcome, &outcome);
         }
 
-        let score = Self::recompute_reputation(&env, &entity)?;
+        let score = Self::recompute_score(&env, &entity)?;
 
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("tx_rec")),
@@ -349,7 +362,7 @@ impl ReputationContract {
         record.rating = Some(rating);
         env.storage().persistent().set(&record_key, &record);
 
-        Self::recompute_reputation(&env, &entity)?;
+        Self::recompute_score(&env, &entity)?;
 
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("rated")),
@@ -451,10 +464,14 @@ impl ReputationContract {
 
     // --- Flagging ---
 
-    /// Report `entity` for fraud or dispute-worthy behavior. A reporter may
-    /// have at most one active (unresolved) flag per entity. Once the
-    /// entity's active flag count reaches
-    /// `ReputationConfig::freeze_threshold_flags`, it is auto-frozen.
+    /// Report `entity` for fraud or dispute-worthy behavior. Reporting is
+    /// gated to the admin or an address that has actually transacted with
+    /// `entity` (i.e. appears as `counterparty` on one of its recorded
+    /// transactions) — otherwise anyone could mint free addresses and
+    /// auto-freeze an arbitrary entity by reaching `freeze_threshold_flags`
+    /// with throwaway reporters. A reporter may have at most one active
+    /// (unresolved) flag per entity. Once the entity's active flag count
+    /// reaches `ReputationConfig::freeze_threshold_flags`, it is auto-frozen.
     pub fn flag_entity(
         env: Env,
         reporter: Address,
@@ -464,6 +481,10 @@ impl ReputationContract {
     ) -> Result<(), ReputationError> {
         reporter.require_auth();
         let config = Self::get_config(env.clone())?;
+        let admin = Self::require_admin(&env)?;
+        if reporter != admin && !Self::has_transacted_with(&env, &entity, &reporter) {
+            return Err(ReputationError::Unauthorized);
+        }
 
         let key = DataKey::Flags(entity.clone());
         let mut flags: Vec<Flag> = env
@@ -672,8 +693,98 @@ impl ReputationContract {
         Ok(())
     }
 
-    /// Recomputes and persists `entity`'s [`ReputationScore`] from its full
-    /// transaction history, per the score formula:
+    /// Returns `true` if `counterparty` appears on at least one of
+    /// `entity`'s recorded transactions. Used to gate [`Self::flag_entity`]
+    /// so only genuine counterparties (or the admin) can report an entity.
+    fn has_transacted_with(env: &Env, entity: &Address, counterparty: &Address) -> bool {
+        let history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TransactionHistory(entity.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        for escrow_id in history.iter() {
+            let record: Option<TransactionRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TransactionRecord(escrow_id));
+            if let Some(record) = record {
+                if record.counterparty == *counterparty {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Reputation(entity.clone()))
+            .unwrap_or(ReputationScore {
+                entity: entity.clone(),
+                score: 0,
+                total_transactions: 0,
+                successful_transactions: 0,
+                disputed_transactions: 0,
+                avg_rating: 0,
+                last_updated: 0,
+            })
+    }
+
+    /// `true` for the outcomes that count toward `successful_transactions`.
+    fn is_successful_outcome(outcome: &TransactionOutcome) -> bool {
+        matches!(
+            outcome,
+            TransactionOutcome::Released | TransactionOutcome::ResolvedSeller
+        )
+    }
+
+    /// Increments `entity`'s lifetime counters for a brand-new escrow.
+    /// Called once per `escrow_id`, not on lifecycle updates — see
+    /// [`Self::apply_outcome_change_counts`] for those.
+    fn apply_new_transaction_counts(env: &Env, entity: &Address, outcome: &TransactionOutcome) {
+        let mut rep = Self::load_or_default_reputation(env, entity);
+        rep.total_transactions += 1;
+        if Self::is_successful_outcome(outcome) {
+            rep.successful_transactions += 1;
+        }
+        if matches!(outcome, TransactionOutcome::Disputed) {
+            rep.disputed_transactions += 1;
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reputation(entity.clone()), &rep);
+    }
+
+    /// Adjusts `entity`'s lifetime counters when an already-recorded escrow's
+    /// outcome changes (e.g. `Disputed` -> `ResolvedSeller`), without
+    /// touching `total_transactions`.
+    fn apply_outcome_change_counts(
+        env: &Env,
+        entity: &Address,
+        prior: &TransactionOutcome,
+        new: &TransactionOutcome,
+    ) {
+        let mut rep = Self::load_or_default_reputation(env, entity);
+        if Self::is_successful_outcome(prior) {
+            rep.successful_transactions = rep.successful_transactions.saturating_sub(1);
+        }
+        if matches!(prior, TransactionOutcome::Disputed) {
+            rep.disputed_transactions = rep.disputed_transactions.saturating_sub(1);
+        }
+        if Self::is_successful_outcome(new) {
+            rep.successful_transactions += 1;
+        }
+        if matches!(new, TransactionOutcome::Disputed) {
+            rep.disputed_transactions += 1;
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reputation(entity.clone()), &rep);
+    }
+
+    /// Recomputes and persists `entity`'s `score`/`avg_rating`/
+    /// `last_updated`, per the score formula:
     ///
     /// ```text
     /// score = sum(recency_weight(r) * outcome_value(r)) / sum(recency_weight(r))
@@ -682,49 +793,61 @@ impl ReputationContract {
     /// with an additional flat penalty of `dispute_penalty_bps` subtracted
     /// per still-relevant (non-fully-decayed) `Disputed` record.
     /// `avg_rating` is computed the same way over records carrying a rating.
-    fn recompute_reputation(
-        env: &Env,
-        entity: &Address,
-    ) -> Result<ReputationScore, ReputationError> {
+    ///
+    /// Only the most recent `SCORE_WINDOW` records feed this computation, so
+    /// `record_transaction` and `rate_entity` stay bounded-cost regardless of
+    /// how large an entity's lifetime history grows; records older than that
+    /// already carry a recency weight close to zero for any realistic
+    /// `decay_window_seconds`, so excluding them from the average has
+    /// negligible effect. `total_transactions` / `successful_transactions` /
+    /// `disputed_transactions` are exact lifetime counts maintained
+    /// separately and incrementally — see [`Self::apply_new_transaction_counts`]
+    /// and [`Self::apply_outcome_change_counts`] — so they are left as-is here.
+    fn recompute_score(env: &Env, entity: &Address) -> Result<ReputationScore, ReputationError> {
         let config = Self::get_config(env.clone())?;
+        let mut rep = Self::load_or_default_reputation(env, entity);
+
         let history: Vec<u64> = env
             .storage()
             .persistent()
             .get(&DataKey::TransactionHistory(entity.clone()))
             .unwrap_or_else(|| Vec::new(env));
         let now = env.ledger().timestamp();
+        let len = history.len();
+        let start = len.saturating_sub(SCORE_WINDOW);
 
         let mut weighted_value_sum: i128 = 0;
         let mut weight_sum: i128 = 0;
         let mut rating_weighted_sum: i128 = 0;
         let mut rating_weight_sum: i128 = 0;
-        let mut successful: u64 = 0;
-        let mut disputed: u64 = 0;
         let mut disputed_recent: i128 = 0;
 
-        for escrow_id in history.iter() {
-            let record: TransactionRecord = env
+        let mut i = start;
+        while i < len {
+            let escrow_id = history.get(i).unwrap();
+            i += 1;
+
+            // A persistent entry can expire its TTL and be archived
+            // independently of `TransactionHistory`; treat a missing record
+            // as no longer relevant to the score rather than failing the
+            // whole recomputation.
+            let record: Option<TransactionRecord> = env
                 .storage()
                 .persistent()
-                .get(&DataKey::TransactionRecord(escrow_id))
-                .unwrap();
+                .get(&DataKey::TransactionRecord(escrow_id));
+            let record = match record {
+                Some(record) => record,
+                None => continue,
+            };
+
             let elapsed = now.saturating_sub(record.recorded_at);
             let weight = recency_weight_bps(elapsed, config.decay_window_seconds);
             let value = outcome_value_bps(&record.outcome);
             weighted_value_sum += weight * value;
             weight_sum += weight;
 
-            match record.outcome {
-                TransactionOutcome::Released | TransactionOutcome::ResolvedSeller => {
-                    successful += 1;
-                }
-                TransactionOutcome::Disputed => {
-                    disputed += 1;
-                    if weight > 0 {
-                        disputed_recent += 1;
-                    }
-                }
-                _ => {}
+            if matches!(record.outcome, TransactionOutcome::Disputed) && weight > 0 {
+                disputed_recent += 1;
             }
 
             if let Some(rating) = record.rating {
@@ -739,26 +862,18 @@ impl ReputationContract {
             0
         };
         let penalty = disputed_recent * (config.dispute_penalty_bps as i128);
-        let score = (base_score - penalty).clamp(0, BPS_SCALE) as u32;
-        let avg_rating = if rating_weight_sum > 0 {
+        rep.score = (base_score - penalty).clamp(0, BPS_SCALE) as u32;
+        rep.avg_rating = if rating_weight_sum > 0 {
             (rating_weighted_sum / rating_weight_sum).clamp(0, BPS_SCALE) as u32
         } else {
             0
         };
+        rep.last_updated = now;
 
-        let score_record = ReputationScore {
-            entity: entity.clone(),
-            score,
-            total_transactions: history.len() as u64,
-            successful_transactions: successful,
-            disputed_transactions: disputed,
-            avg_rating,
-            last_updated: now,
-        };
         env.storage()
             .persistent()
-            .set(&DataKey::Reputation(entity.clone()), &score_record);
-        Ok(score_record)
+            .set(&DataKey::Reputation(entity.clone()), &rep);
+        Ok(rep)
     }
 }
 
