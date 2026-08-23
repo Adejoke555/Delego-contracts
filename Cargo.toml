@@ -3,6 +3,7 @@ members = [
     "delegation_registry",
     "escrow",
     "permissions",
+    "reputation",
     "tests",
 ]
 resolver = "2"

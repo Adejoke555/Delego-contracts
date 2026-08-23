@@ -8,11 +8,13 @@ publish = false
 soroban-sdk = { workspace = true }
 delego-escrow = { path = "../escrow" }
 delego-permissions = { path = "../permissions" }
+delego-reputation = { path = "../reputation" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 delego-escrow = { path = "../escrow", features = ["testutils"] }
 delego-permissions = { path = "../permissions", features = ["testutils"] }
+delego-reputation = { path = "../reputation", features = ["testutils"] }
 
 [[test]]
 name = "cross_contract"
