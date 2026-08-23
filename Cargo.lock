@@ -416,6 +416,7 @@ version = "0.0.1"
 dependencies = [
  "delego-escrow",
  "delego-permissions",
+ "delego-reputation",
  "soroban-sdk",
 ]
 
@@ -438,6 +439,13 @@ name = "delego-permissions"
 version = "0.0.1"
 dependencies = [
  "ed25519-dalek",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "delego-reputation"
+version = "0.0.1"
+dependencies = [
  "soroban-sdk",
 ]
 

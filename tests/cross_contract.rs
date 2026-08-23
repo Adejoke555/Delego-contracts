@@ -2,6 +2,9 @@
 
 use delego_escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
 use delego_permissions::{PermissionsContract, PermissionsContractClient};
+use delego_reputation::{
+    ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
+};
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
 
 struct TestEnv {
@@ -180,4 +183,68 @@ fn test_end_to_end_delegated_purchase() {
 
     let record = escrow_client.get_escrow(&escrow_id);
     assert!(matches!(record.status, EscrowStatus::Released));
+}
+
+/// Simulates the recommended v1 escrow/reputation integration (issue #18):
+/// an authorized backend indexer observes the escrow's release and reports
+/// the outcome to the reputation contract, rather than escrow calling
+/// reputation directly.
+#[test]
+fn test_reputation_recorded_after_escrow_release() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    let reputation_admin = Address::generate(&t.env);
+    let reputation_contract_id = t.env.register(ReputationContract, ());
+    let reputation_client = ReputationContractClient::new(&t.env, &reputation_contract_id);
+    reputation_client.initialize(
+        &reputation_admin,
+        &ReputationConfig {
+            decay_window_seconds: 90 * 24 * 60 * 60,
+            min_transactions_threshold: 1,
+            dispute_penalty_bps: 500,
+            freeze_threshold_flags: 3,
+        },
+    );
+
+    let limit_total = 1000i128;
+    let limit_per_tx = 500i128;
+    let ttl_ledgers = 36000u32;
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    perm_client.grant(
+        &t.buyer,
+        &t.agent,
+        &limit_total,
+        &limit_per_tx,
+        &merchants,
+        &ttl_ledgers,
+    );
+
+    let escrow_id = delegated_deposit(&t, 400, 3600);
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    let released = escrow_client.get_escrow(&escrow_id);
+    assert!(matches!(released.status, EscrowStatus::Released));
+
+    // Backend indexer relays the observed outcome to the reputation contract.
+    reputation_client.record_transaction(
+        &reputation_admin,
+        &escrow_id,
+        &t.seller,
+        &t.buyer,
+        &released.amount,
+        &TransactionOutcome::Released,
+    );
+
+    let reputation = reputation_client.get_reputation(&t.seller);
+    assert_eq!(reputation.total_transactions, 1);
+    assert_eq!(reputation.successful_transactions, 1);
+    assert_eq!(reputation.score, 10_000);
+
+    // The buyer, as counterparty, may now rate the seller for this escrow.
+    reputation_client.rate_entity(&t.buyer, &escrow_id, &t.seller, &9500u32);
+    let breakdown = reputation_client.get_reputation_breakdown(&t.seller, &0u32, &10u32);
+    assert_eq!(breakdown.get(0).unwrap().rating, Some(9500u32));
 }
