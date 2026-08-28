@@ -768,7 +768,7 @@ mod test {
 
         let v = client.check_version();
         assert_eq!(v.name, symbol_short!("escrow"));
-        assert_eq!(v.semver, symbol_short!("0_1_0"));
+        assert_eq!(v.semver, symbol_short!("0_2_0"));
         assert_eq!(v, client.version());
     }
 
@@ -1676,6 +1676,115 @@ mod test {
         assert!(
             after.accrued > 0,
             "yield should still be non-zero after partial release"
+        );
+    }
+
+    // ─── Issue #35: updated_at lifecycle tests ──────────────────────────────
+
+    /// updated_at must be set to the ledger timestamp on creation.
+    #[test]
+    fn test_updated_at_set_on_creation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[80u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(record.updated_at, record.created_at);
+    }
+
+    /// updated_at must advance when escrow status changes (fund → dispute).
+    #[test]
+    fn test_updated_at_advances_on_dispute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[81u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let after_deposit = client.get_escrow(&escrow_id);
+        assert_eq!(after_deposit.updated_at, after_deposit.created_at);
+
+        // Advance ledger and dispute.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 50;
+        });
+
+        client.dispute(&escrow_id, &buyer);
+
+        let after_dispute = client.get_escrow(&escrow_id);
+        assert!(
+            after_dispute.updated_at >= after_deposit.updated_at,
+            "updated_at must advance after dispute"
+        );
+    }
+
+    /// updated_at must advance across a full lifecycle: deposit → dispute → resolve.
+    #[test]
+    fn test_updated_at_advances_full_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[82u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let r1 = client.get_escrow(&escrow_id);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 50;
+        });
+        client.dispute(&escrow_id, &buyer);
+        let r2 = client.get_escrow(&escrow_id);
+        assert!(r2.updated_at >= r1.updated_at);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 100;
+        });
+        client.resolve_dispute(&escrow_id, &admin, &true);
+        let r3 = client.get_escrow(&escrow_id);
+        assert!(
+            r3.updated_at >= r2.updated_at,
+            "updated_at must advance through resolve"
         );
     }
 }
