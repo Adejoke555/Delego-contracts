@@ -301,6 +301,19 @@ pub struct TreasuryShare {
     pub bps: u32,
 }
 
+/// Net seller payout plus the platform fee deducted for a release amount,
+/// as computed by `compute_payout` (issue #27).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleasePayout {
+    /// Amount the seller actually receives after the fee is deducted.
+    pub seller_net: i128,
+    /// Total fee charged across all treasuries.
+    pub fee: i128,
+    /// Primary treasury that receives the fee (from `FeeConfig`).
+    pub treasury: Address,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowAmountLimits {
@@ -997,13 +1010,12 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
-            let fee = Self::distribute_fee(&env, &token_client, record.amount)?;
-            let seller_amount = record.amount - fee;
-
+            let payout = Self::compute_payout(&env, record.amount)?;
+            Self::distribute_fee(&env, &token_client, record.amount)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
-                &seller_amount,
+                &payout.seller_net,
             );
             record.status = EscrowStatus::Released;
         } else {
@@ -1221,27 +1233,67 @@ impl EscrowContract {
             .get(&DataKey::FeeDistribution)
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
 
-        if !shares.is_empty() {
-            let mut total_fee: i128 = 0;
+        let total_fee = Self::compute_fee_amount(env, amount)?;
+        if total_fee == 0 {
+            return Ok(0);
+        }
+
+        if shares.is_empty() {
+            let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+            token_client.transfer(
+                &env.current_contract_address(),
+                &fee_config.treasury,
+                &total_fee,
+            );
+        } else {
             for share in shares.iter() {
                 let bps = share.bps as i128;
                 let fee = (amount / 10_000i128) * bps + ((amount % 10_000i128) * bps) / 10_000i128;
                 if fee > 0 {
                     token_client.transfer(&env.current_contract_address(), &share.treasury, &fee);
-                    total_fee += fee;
                 }
+            }
+        }
+        Ok(total_fee)
+    }
+
+    /// Computes the total release fee (in tokens) for `amount`, splitting it
+    /// across the configured multi-treasury distribution when one is set,
+    /// falling back to the single-treasury `FeeConfig` otherwise. Never
+    /// transfers tokens and never panics on a missing config: returns
+    /// `FeeConfigNotSet` when no config exists.
+    fn compute_fee_amount(env: &Env, amount: i128) -> Result<i128, EscrowError> {
+        let shares: soroban_sdk::Vec<TreasuryShare> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeDistribution)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+        if !shares.is_empty() {
+            let mut total_fee: i128 = 0;
+            for share in shares.iter() {
+                let bps = share.bps as i128;
+                total_fee +=
+                    (amount / 10_000i128) * bps + ((amount % 10_000i128) * bps) / 10_000i128;
             }
             Ok(total_fee)
         } else {
             let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
             let fee_bps = fee_config.fee_bps as i128;
-            let fee =
-                (amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128;
-            if fee > 0 {
-                token_client.transfer(&env.current_contract_address(), &fee_config.treasury, &fee);
-            }
-            Ok(fee)
+            Ok((amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128)
         }
+    }
+
+    /// Computes the net seller payout and platform fee for `amount` (issue #27).
+    /// Pure calculation — see `distribute_fee` for the transfer side.
+    fn compute_payout(env: &Env, amount: i128) -> Result<ReleasePayout, EscrowError> {
+        let fee = Self::compute_fee_amount(env, amount)?;
+        let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+        Ok(ReleasePayout {
+            seller_net: amount - fee,
+            fee,
+            treasury: fee_config.treasury,
+        })
     }
 
     /// Add a token to the escrow whitelist. Admin-only.
@@ -1891,6 +1943,7 @@ impl EscrowContract {
     /// Release a partial amount to the seller.
     /// `release_amount` must be <= (record.amount - record.released_amount).
     /// If release_amount equals the remaining balance, set status to Released.
+    /// The platform fee is deducted from `release_amount` (issue #27).
     pub fn partial_release(
         env: Env,
         escrow_id: u64,
@@ -1933,6 +1986,12 @@ impl EscrowContract {
     /// Shared release logic used by both `partial_release` and
     /// `evaluate_and_release`. Callers are responsible for their own
     /// authorization checks before invoking this.
+    ///
+    /// The platform fee (per `FeeConfig` or the multi-treasury
+    /// `FeeDistribution`) is deducted from `release_amount` and transferred to
+    /// the treasury(ies); the seller receives the remainder (issue #27).
+    /// `released_amount` tracks the full escrow-amount released, not the net
+    /// seller payout.
     fn execute_release(
         env: &Env,
         escrow_id: u64,
@@ -1951,10 +2010,13 @@ impl EscrowContract {
         }
 
         let token_client = soroban_sdk::token::Client::new(env, &record.token);
+
+        let payout = Self::compute_payout(env, release_amount)?;
+        Self::distribute_fee(env, &token_client, release_amount)?;
         token_client.transfer(
             &env.current_contract_address(),
             &record.seller,
-            &release_amount,
+            &payout.seller_net,
         );
 
         record.released_amount += release_amount;
@@ -2003,6 +2065,7 @@ impl EscrowContract {
     }
 
     /// Release escrowed funds to the seller. Only the buyer or admin may call.
+    /// The platform fee is deducted from the released amount (issue #27).
     pub fn release(
         env: Env,
         escrow_id: u64,
@@ -2193,7 +2256,8 @@ impl EscrowContract {
     }
 
     /// Query the configured oracle and release the full remaining balance to the
-    /// seller if the condition it reports is met (issue #339).
+    /// seller if the condition it reports is met (issue #339). The seller
+    /// receives the remaining balance minus the platform fee (issue #27).
     ///
     /// Any caller may trigger evaluation once a condition has been configured via
     /// `set_release_condition` — authorization to move funds comes from the
@@ -2302,13 +2366,12 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
-            let fee = Self::distribute_fee(&env, &token_client, record.amount)?;
-            let seller_amount = record.amount - fee;
-
+            let payout = Self::compute_payout(&env, record.amount)?;
+            Self::distribute_fee(&env, &token_client, record.amount)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
-                &seller_amount,
+                &payout.seller_net,
             );
             record.status = EscrowStatus::Released;
         } else {
