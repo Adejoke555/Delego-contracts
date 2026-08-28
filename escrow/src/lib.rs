@@ -1415,11 +1415,9 @@ impl EscrowContract {
     /// shared liquidity pool for that escrow's token, instead of going
     /// through the ordinary buyer/admin-triggered `release` flow. Admin-only.
     ///
-    /// The pool's tracked balance is left unchanged by a settlement: the
-    /// amount it fronts to the seller is immediately backed by the settling
-    /// escrow's own already-deposited funds, which remain held by this
-    /// contract. `pool.balance` therefore always reflects real, currently
-    /// unencumbered liquidity available to back further instant settlements.
+    /// The settled amount is debited from the pool's tracked balance so that
+    /// `pool.balance` always reflects real, currently unencumbered liquidity
+    /// and a later `withdraw_from_pool` cannot over-commit the same tokens.
     pub fn settle_from_pool(
         env: Env,
         escrow_id: u64,
@@ -1446,7 +1444,7 @@ impl EscrowContract {
         }
 
         let pool_key = DataKey::LiquidityPool(record.token.clone());
-        let pool: LiquidityPool = env
+        let mut pool: LiquidityPool = env
             .storage()
             .instance()
             .get(&pool_key)
@@ -1457,6 +1455,12 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         token_client.transfer(&env.current_contract_address(), &record.seller, &remaining);
+
+        pool.balance = pool
+            .balance
+            .checked_sub(remaining)
+            .ok_or(EscrowError::InsufficientPoolBalance)?;
+        env.storage().instance().set(&pool_key, &pool);
 
         record.released_amount = record.amount;
         record.status = EscrowStatus::Released;
