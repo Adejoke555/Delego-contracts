@@ -457,6 +457,9 @@ pub enum DataKey {
     EscrowYieldConfig(u64),
     /// Release condition for an escrow.
     ReleaseCondition(u64),
+    /// Admin flag: when `true`, buyer-originated releases on the escrow must
+    /// pass `get_release_eligibility` (issue #48).
+    RequireReleaseCondition(u64),
 }
 
 #[contracterror]
@@ -1927,6 +1930,19 @@ impl EscrowContract {
         }
         Self::validate_release_status(&record)?;
 
+        // When the admin has required it, buyer-originated releases must pass
+        // the release-eligibility gate (issue #48). Admins are not gated.
+        if caller == record.buyer
+            && env
+                .storage()
+                .persistent()
+                .get(&DataKey::RequireReleaseCondition(escrow_id))
+                .unwrap_or(false)
+            && Self::release_block_reason(env.clone(), &record).is_some()
+        {
+            return Err(EscrowError::ConditionNotMet);
+        }
+
         Self::execute_release(&env, escrow_id, &key, record, caller, release_amount)
     }
 
@@ -3190,6 +3206,46 @@ impl EscrowContract {
             .persistent()
             .remove(&DataKey::ReleaseCondition(escrow_id));
         Ok(())
+    }
+
+    /// Enable or disable the release-condition gate for buyer-originated
+    /// releases on an escrow (issue #48). Admin-only.
+    ///
+    /// When `require` is `true`, buyer-originated `partial_release`/`release`
+    /// on this escrow are blocked unless `get_release_eligibility` returns
+    /// eligible. The default is `false` for backward compatibility.
+    pub fn set_require_release_condition(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        require: bool,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+        if !Self::is_admin(env.clone(), caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        check_not_terminal(&record)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RequireReleaseCondition(escrow_id), &require);
+        Ok(true)
+    }
+
+    /// Read-only getter for whether buyer-originated releases on an escrow are
+    /// gated on the release condition. Defaults to `false` when unset.
+    pub fn get_require_release_condition(env: Env, escrow_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RequireReleaseCondition(escrow_id))
+            .unwrap_or(false)
     }
 
     // ── Ticket 2: get_yield_config ────────────────────────────────────────────
