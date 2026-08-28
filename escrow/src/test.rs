@@ -1620,4 +1620,62 @@ mod test {
             "snapshot_ledger must advance"
         );
     }
+
+    // ─── Issue #33: Partial-release yield test ────────────────────────────────
+
+    /// After a partial release, yield must be computed on the remaining
+    /// principal, not the original amount.
+    #[test]
+    fn test_get_accrued_yield_scales_by_remaining_principal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[70u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let lending = Address::generate(&env);
+        client.set_yield_config(&admin, &escrow_id, &lending, &1_000u32); // 10% APR
+
+        // Advance 1 year so yield is non-trivial.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1000;
+            li.timestamp = 31_536_000; // ~1 year in seconds
+        });
+
+        // Before partial release: yield on full 1000 principal.
+        let before = client.get_accrued_yield(&escrow_id);
+        assert_eq!(before.principal, 1_000i128);
+        assert!(before.accrued > 0, "yield should be non-zero");
+
+        // Partial release: 500 of 1000.
+        client.partial_release(&escrow_id, &buyer, &500);
+
+        // After partial release: yield must be computed on remaining 500.
+        let after = client.get_accrued_yield(&escrow_id);
+        assert_eq!(after.principal, 500i128);
+        // accrued should be roughly half of before (same time, half principal).
+        assert!(
+            after.accrued < before.accrued,
+            "yield after partial release must be less than before ({} < {})",
+            after.accrued,
+            before.accrued
+        );
+        assert!(
+            after.accrued > 0,
+            "yield should still be non-zero after partial release"
+        );
+    }
 }
