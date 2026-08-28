@@ -68,6 +68,10 @@ pub enum PermissionError {
     VelocityLimitExceeded = 406,
     /// sweep_inactive called before admin has configured an inactivity threshold
     InactivityThresholdNotSet = 407,
+    /// A pending allowance decrease already exists for this delegation
+    PendingDecreaseExists = 408,
+    /// Time-lock on pending allowance decrease has not elapsed yet
+    TimeLockActive = 409,
 }
 
 #[contracttype]
@@ -1603,7 +1607,12 @@ impl PermissionsContract {
         Ok(())
     }
 
-    pub fn decrease_allowance(env: Env, owner: Address, delegate: Address, amount: i128) -> bool {
+    pub fn decrease_allowance(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        amount: i128,
+    ) -> Result<(), PermissionError> {
         owner.require_auth();
 
         let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
@@ -1611,7 +1620,7 @@ impl PermissionsContract {
 
         let pend_key = DataKey::PendingDecrement(owner.clone(), delegate.clone());
         if env.storage().persistent().has(&pend_key) {
-            panic!("Pending decrement already exists for this delegation");
+            return Err(PermissionError::PendingDecreaseExists);
         }
 
         let execution_time = env.ledger().timestamp() + 86400;
@@ -1623,17 +1632,21 @@ impl PermissionsContract {
 
         env.storage().persistent().set(&pend_key, &pending);
 
-        true
+        Ok(())
     }
 
-    pub fn execute_decrease_allowance(env: Env, owner: Address, delegate: Address) -> bool {
+    pub fn execute_decrease_allowance(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<(), PermissionError> {
         owner.require_auth();
 
         let pend_key = DataKey::PendingDecrement(owner.clone(), delegate.clone());
         let pending: PendingAllowanceDecrement = env.storage().persistent().get(&pend_key).unwrap();
 
         if env.ledger().timestamp() < pending.execution_time {
-            panic!("Time-lock has not elapsed yet");
+            return Err(PermissionError::TimeLockActive);
         }
 
         let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
@@ -1642,7 +1655,7 @@ impl PermissionsContract {
         let previous_limit = record.limit_total;
         let new_limit = record.limit_total - pending.amount;
         if new_limit < record.spent {
-            panic!("Decrease would exceed current spent amount");
+            return Err(PermissionError::ExceedsTotalLimit);
         }
 
         record.limit_total = new_limit;
@@ -1659,7 +1672,7 @@ impl PermissionsContract {
             },
         );
 
-        true
+        Ok(())
     }
 
     pub fn pause(env: Env, owner: Address, delegate: Address) -> Result<(), PermissionError> {

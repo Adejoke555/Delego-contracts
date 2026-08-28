@@ -375,21 +375,20 @@ fn test_decrease_allowance_timelock() {
         &ttl_ledgers,
     );
 
-    assert!(client.decrease_allowance(&t.buyer, &t.agent, &200));
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
 
     // Advance past the 24h timelock (86400 seconds)
     t.env
         .ledger()
         .set_timestamp(t.env.ledger().timestamp() + 86401);
 
-    assert!(client.execute_decrease_allowance(&t.buyer, &t.agent));
+    client.execute_decrease_allowance(&t.buyer, &t.agent);
 
     // Verify allowance was decreased
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 800);
 }
 
 #[test]
-#[should_panic(expected = "Time-lock has not elapsed yet")]
 fn test_decrease_allowance_timelock_blocked() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
@@ -408,14 +407,52 @@ fn test_decrease_allowance_timelock_blocked() {
         &ttl_ledgers,
     );
 
-    assert!(client.decrease_allowance(&t.buyer, &t.agent, &200));
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
 
     // Jump time but not enough (24h = 86400 seconds)
     t.env
         .ledger()
         .set_timestamp(t.env.ledger().timestamp() + 86399);
 
-    client.execute_decrease_allowance(&t.buyer, &t.agent);
+    assert_eq!(
+        client.try_execute_decrease_allowance(&t.buyer, &t.agent),
+        Err(Ok(PermissionError::TimeLockActive))
+    );
+}
+
+#[test]
+fn test_decrease_allowance_rejects_pending_decrease() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+
+    assert_eq!(
+        client.try_decrease_allowance(&t.buyer, &t.agent, &100),
+        Err(Ok(PermissionError::PendingDecreaseExists))
+    );
+}
+
+#[test]
+fn test_execute_decrease_allowance_rejects_below_spent_amount() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchant = soroban_sdk::Address::generate(&t.env);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &1000, &merchants, &36000);
+    client.execute_spend(&t.buyer, &t.agent, &800, &merchant);
+    client.decrease_allowance(&t.buyer, &t.agent, &300);
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 86401);
+
+    assert_eq!(
+        client.try_execute_decrease_allowance(&t.buyer, &t.agent),
+        Err(Ok(PermissionError::ExceedsTotalLimit))
+    );
 }
 
 // ── Issue #334: Gasless Spend Execution via Relayer Pattern ───────────────
