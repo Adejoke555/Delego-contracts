@@ -484,6 +484,12 @@ fn test_suspension_closing_and_mutation_locking() {
         susp_err.unwrap_err().unwrap(),
         MarketplaceError::MerchantClosed
     );
+
+    let unsusp_err = f.client.try_unsuspend_merchant(&f.admin, &id);
+    assert_eq!(
+        unsusp_err.unwrap_err().unwrap(),
+        MarketplaceError::MerchantClosed
+    );
 }
 
 #[test]
@@ -631,17 +637,33 @@ fn test_reputation_score_injection_with_contract() {
     let view_before = f.client.get_merchant_view(&id);
     assert_eq!(view_before.reputation_score, None);
 
-    // Set reputation contract for merchant
+    // Non-admin cannot set reputation contract (CWE-345 protection)
+    let unauth_err = f
+        .client
+        .try_set_merchant_reputation(&seller, &id, &Some(rep_id.clone()));
+    assert_eq!(
+        unauth_err.unwrap_err().unwrap(),
+        MarketplaceError::Unauthorized
+    );
+
+    // Admin sets reputation contract for merchant
     f.client
-        .set_merchant_reputation(&seller, &id, &Some(rep_id.clone()));
+        .set_merchant_reputation(&f.admin, &id, &Some(rep_id.clone()));
     let view_after = f.client.get_merchant_view(&id);
-    assert_eq!(view_after.reputation_score, Some(10_000));
+    let expected_score = rep_client.get_reputation(&seller).score;
+    let injected = view_after
+        .reputation_score
+        .expect("score must be read from the reputation contract");
+    assert_eq!(injected, expected_score);
 
     // Also test global reputation contract fallback
-    f.client.set_merchant_reputation(&seller, &id, &None);
+    f.client.set_merchant_reputation(&f.admin, &id, &None);
     f.client.set_reputation_contract(&f.admin, &rep_id);
     let view_fallback = f.client.get_merchant_view(&id);
-    assert_eq!(view_fallback.reputation_score, Some(10_000));
+    let fallback_injected = view_fallback
+        .reputation_score
+        .expect("fallback score must be read from global reputation contract");
+    assert_eq!(fallback_injected, expected_score);
 }
 
 /// Acceptance flight test:

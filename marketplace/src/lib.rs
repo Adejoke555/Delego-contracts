@@ -239,6 +239,9 @@ pub struct ExternalReputationScore {
 
 const MAX_COMMISSION_BPS: u32 = 10_000;
 const DEFAULT_METADATA_COOLDOWN_SECS: u64 = 86_400; // 24 hours
+const MAX_PAGE_LIMIT: u32 = 50;
+const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
+const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 
 #[contract]
 pub struct MarketplaceContract;
@@ -263,9 +266,6 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .set(&DataKey::Verifiers, &Vec::<Verifier>::new(&env));
-        env.storage()
-            .instance()
-            .set(&DataKey::MerchantIds, &Vec::<u64>::new(&env));
         env.storage()
             .instance()
             .set(&DataKey::MetadataCooldown, &DEFAULT_METADATA_COOLDOWN_SECS);
@@ -340,15 +340,15 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::LastMetadataUpdate(next_id), &now);
 
-        // Append to full merchant ids index
+        // Append to full merchant ids index (persistent storage)
         let mut merchant_ids: Vec<u64> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::MerchantIds)
             .unwrap_or_else(|| Vec::new(&env));
         merchant_ids.push_back(next_id);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::MerchantIds, &merchant_ids);
 
         // Append to category index
@@ -360,6 +360,41 @@ impl MarketplaceContract {
             .unwrap_or_else(|| Vec::new(&env));
         cat_ids.push_back(next_id);
         env.storage().persistent().set(&cat_key, &cat_ids);
+
+        // Extend TTL for all persistent entries created
+        let storage = env.storage().persistent();
+        storage.extend_ttl(
+            &DataKey::Merchant(next_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        storage.extend_ttl(&name_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        storage.extend_ttl(
+            &DataKey::RequiredVerifications(next_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        storage.extend_ttl(
+            &DataKey::VerifiedCount(next_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        storage.extend_ttl(
+            &DataKey::MerchantVerifierList(next_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        storage.extend_ttl(
+            &DataKey::LastMetadataUpdate(next_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        storage.extend_ttl(
+            &DataKey::MerchantIds,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        storage.extend_ttl(&cat_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         // Increment monotonic counter
         let incremented = next_id
@@ -706,10 +741,25 @@ impl MarketplaceContract {
     // --- Discovery & Query ---
 
     pub fn get_merchant(env: Env, merchant_id: u64) -> Result<Merchant, MarketplaceError> {
-        env.storage()
+        let merchant: Merchant = env
+            .storage()
             .persistent()
             .get(&DataKey::Merchant(merchant_id))
-            .ok_or(MarketplaceError::MerchantNotFound)
+            .ok_or(MarketplaceError::MerchantNotFound)?;
+
+        let storage = env.storage().persistent();
+        storage.extend_ttl(
+            &DataKey::Merchant(merchant_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        storage.extend_ttl(
+            &DataKey::MerchantName(merchant.name.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(merchant)
     }
 
     pub fn get_merchant_view(env: Env, merchant_id: u64) -> Result<MerchantView, MarketplaceError> {
@@ -756,9 +806,10 @@ impl MarketplaceContract {
         offset: u32,
         limit: u32,
     ) -> Result<Vec<MerchantView>, MarketplaceError> {
+        let limit = limit.min(MAX_PAGE_LIMIT);
         let merchant_ids: Vec<u64> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::MerchantIds)
             .unwrap_or_else(|| Vec::new(&env));
 
@@ -786,6 +837,7 @@ impl MarketplaceContract {
         offset: u32,
         limit: u32,
     ) -> Result<Vec<MerchantView>, MarketplaceError> {
+        let limit = limit.min(MAX_PAGE_LIMIT);
         let cat_ids: Vec<u64> = env
             .storage()
             .persistent()
@@ -967,22 +1019,18 @@ impl MarketplaceContract {
 
     pub fn set_merchant_reputation(
         env: Env,
-        caller: Address,
+        admin: Address,
         merchant_id: u64,
         reputation: Option<Address>,
     ) -> Result<(), MarketplaceError> {
-        caller.require_auth();
+        admin.require_auth();
+        let current_admin = Self::get_admin(env.clone())?;
+        if admin != current_admin {
+            return Err(MarketplaceError::Unauthorized);
+        }
 
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
         Self::check_not_frozen_or_closed(&merchant)?;
-
-        let admin = Self::get_admin(env.clone())?;
-        let is_admin = caller == admin;
-        let is_owner = merchant.owner == Some(caller.clone());
-
-        if !is_admin && !is_owner {
-            return Err(MarketplaceError::Unauthorized);
-        }
 
         merchant.reputation = reputation.clone();
         merchant.updated_at = env.ledger().timestamp();
@@ -996,7 +1044,7 @@ impl MarketplaceContract {
             MerchantReputationSetEvent {
                 merchant_id,
                 reputation,
-                set_by: caller,
+                set_by: admin,
             },
         );
 

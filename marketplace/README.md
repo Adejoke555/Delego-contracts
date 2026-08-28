@@ -17,7 +17,7 @@ The Marketplace Contract maintains a trusted on-chain registry of merchants on t
 
 ### Initialization
 ```rust
-pub fn __constructor(env: Env, admin: Address) -> Result<bool, MarketplaceError>
+pub fn __constructor(env: Env, admin: Address) -> Result<(), MarketplaceError>
 ```
 
 ### Merchant Lifecycle
@@ -58,7 +58,7 @@ pub fn close_merchant(env: Env, admin: Address, merchant_id: u64) -> Result<(), 
 
 ### Reputation & Admin
 ```rust
-pub fn set_merchant_reputation(env: Env, caller: Address, merchant_id: u64, reputation: Option<Address>) -> Result<(), MarketplaceError>
+pub fn set_merchant_reputation(env: Env, admin: Address, merchant_id: u64, reputation: Option<Address>) -> Result<(), MarketplaceError>
 pub fn set_reputation_contract(env: Env, admin: Address, reputation: Address) -> Result<(), MarketplaceError>
 pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), MarketplaceError>
 pub fn accept_admin(env: Env, caller: Address) -> Result<(), MarketplaceError>
@@ -71,4 +71,4 @@ pub fn version(env: Env) -> ContractVersion
 
 ## Discovery Implementation Notes
 
-`get_merchants` and `get_merchants_by_category` iterate monotonic identifier indices stored in instance and persistent state and slice with `offset` and `limit`. Note that a full index refactor (such as status buckets or ordered key-value trees) is planned for high-throughput scaling and tracked in issue #23.
+`get_merchants` and `get_merchants_by_category` iterate monotonic identifier indices stored in persistent state and slice with `offset` and bounded `limit`. Note that a full index refactor (such as status buckets or ordered key-value trees) is planned for high-throughput scaling and tracked in issue #23.

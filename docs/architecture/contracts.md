@@ -138,13 +138,13 @@ Tracks delegation records with expiry and versioned rollback/upgrade support.
 - Read delegation state for off-chain services
 - Versioned rollback of delegation state
 
-### Reputation Contract (Planned)
+### Reputation Contract
 
 **On-chain State**: Cumulative scores
 
 #### Purpose
 
-The reputation contract will track on-chain reputation scores for merchants and agents, enabling trust-based decision making.
+The reputation contract tracks on-chain reputation scores for merchants and agents, enabling trust-based decision making.
 
 - `record_transaction(merchant, amount, rating)`: Record transaction and rating
 - `get_reputation(entity)`: Get reputation score
