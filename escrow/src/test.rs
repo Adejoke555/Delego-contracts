@@ -1461,4 +1461,163 @@ mod test {
         }
         assert_eq!(count, 1, "third vote should emit exactly one DisputeVotedEvent");
     }
+
+    // ─── Issue #34: Monotonic YieldView Tests ────────────────────────────────
+
+    #[test]
+    fn test_get_accrued_yield_returns_yield_view() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[60u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let lending = Address::generate(&env);
+        let apr_bps = 500u32; // 5% APR
+        client.set_yield_config(&admin, &escrow_id, &lending, &apr_bps);
+
+        let view = client.get_accrued_yield(&escrow_id);
+        assert_eq!(view.escrow_id, escrow_id);
+        assert_eq!(view.principal, 1_000i128);
+        assert_eq!(view.apy_bps, 500);
+        assert_eq!(view.snapshot_ledger, env.ledger().sequence());
+        // accrued may be 0 at ledger 0 since created_at == timestamp
+        assert!(view.accrued >= 0);
+    }
+
+    #[test]
+    fn test_get_accrued_yield_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+
+        let res = client.try_get_accrued_yield(&999u64);
+        assert_eq!(res, Err(Ok(EscrowError::NotFound)));
+    }
+
+    #[test]
+    fn test_get_accrued_yield_no_config_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[61u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+        // No yield config set.
+
+        let view = client.get_accrued_yield(&escrow_id);
+        assert_eq!(view.escrow_id, escrow_id);
+        assert_eq!(view.principal, 1_000i128);
+        assert_eq!(view.apy_bps, 0);
+        assert_eq!(view.held_seconds, 0);
+        assert_eq!(view.accrued, 0);
+    }
+
+    /// Same-block reads must be identical.
+    #[test]
+    fn test_get_accrued_yield_same_block_reads_identical() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[62u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let lending = Address::generate(&env);
+        client.set_yield_config(&admin, &escrow_id, &lending, &500u32);
+
+        // Two reads within the same ledger must be identical.
+        let view_a = client.get_accrued_yield(&escrow_id);
+        let view_b = client.get_accrued_yield(&escrow_id);
+
+        assert_eq!(view_a, view_b, "same-block reads must be identical");
+        assert_eq!(view_a.snapshot_ledger, view_b.snapshot_ledger);
+        assert_eq!(view_a.held_seconds, view_b.held_seconds);
+        assert_eq!(view_a.accrued, view_b.accrued);
+    }
+
+    /// Cross-block reads must be monotonically non-decreasing.
+    #[test]
+    fn test_get_accrued_yield_cross_block_monotonic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[63u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let lending = Address::generate(&env);
+        client.set_yield_config(&admin, &escrow_id, &lending, &500u32);
+
+        let view_before = client.get_accrued_yield(&escrow_id);
+
+        // Advance 100 ledgers.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = li.sequence_number + 100;
+        });
+
+        let view_after = client.get_accrued_yield(&escrow_id);
+
+        assert!(
+            view_after.held_seconds >= view_before.held_seconds,
+            "held_seconds must be monotonically non-decreasing"
+        );
+        assert!(
+            view_after.accrued >= view_before.accrued,
+            "accrued yield must be monotonically non-decreasing"
+        );
+        assert!(
+            view_after.snapshot_ledger > view_before.snapshot_ledger,
+            "snapshot_ledger must advance"
+        );
+    }
 }
