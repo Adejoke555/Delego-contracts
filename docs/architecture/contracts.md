@@ -149,16 +149,19 @@ The reputation contract will track on-chain reputation scores for merchants and 
 - `record_transaction(merchant, amount, rating)`: Record transaction and rating
 - `get_reputation(entity)`: Get reputation score
 
-### Marketplace Contract (Planned)
+### Marketplace Contract
 
-**On-chain State**: Merchant registry, listing anchors
+**On-chain State**: Merchant registry, verification, commission configuration, listing anchors
 
 #### Purpose
 
-The marketplace contract will maintain a registry of merchants and anchors, enabling discovery and verification of trusted merchants.
+The marketplace contract maintains a registry of merchants and anchors, enabling discovery and verification of trusted merchants, per-merchant commission tracking, and reputation scoring pairing.
 
-- `register_merchant(merchant, metadata)`: Register merchant
-- `verify_merchant(merchant)`: Verify merchant
+- `register_merchant(merchant, params)`: Register merchant
+- `verify_merchant(merchant_id, verifier)`: Verify merchant with multi-verifier threshold
+- `get_merchants(offset, limit)`: Paginated discovery
+- `get_merchants_by_category(category, offset, limit)`: Category-filtered discovery
+- `get_merchant_view(merchant_id)`: View with injected reputation score snapshot
 
 ## On-Chain vs Off-Chain
 
@@ -169,8 +172,8 @@ Trust-critical operations that require blockchain guarantees:
 - **Escrow**: Fund locking and release
 - **Permissions**: Spending authority delegation
 - **Delegation Registry**: Delegation records with expiry and rollback
-- **Reputation** (planned): Reputation score tracking
-- **Marketplace** (planned): Merchant registry and verification
+- **Reputation**: Reputation score tracking
+- **Marketplace**: Merchant registry, verification, and discovery
 
 ### Off-Chain (Services)
 
