@@ -4,6 +4,7 @@ members = [
     "escrow",
     "permissions",
     "reputation",
+    "marketplace",
     "tests",
 ]
 resolver = "2"
