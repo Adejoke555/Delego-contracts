@@ -189,6 +189,20 @@ pub struct EscrowResolvedEvent {
     pub resolved_by: Address,
 }
 
+/// Emitted on each arbiter vote during dispute resolution (#32).
+///
+/// Reports live tallies so indexers and UIs can track quorum progress
+/// on-chain without replaying storage diffs.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DisputeVotedEvent {
+    pub escrow_id: u64,
+    pub arbiter: Address,
+    pub release_to_seller: bool,
+    pub votes_for: u32,
+    pub threshold: u32,
+}
+
 /// Emitted when escrowed funds are split among multiple recipients (#321).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -927,10 +941,27 @@ impl EscrowContract {
         }
 
         votes.push_back(DisputeVote {
-            arbiter,
+            arbiter: arbiter.clone(),
             release_to_seller,
         });
         env.storage().persistent().set(&votes_key, &votes);
+
+        // Compute live tallies so the event reflects the state *after* this vote.
+        let votes_for = votes
+            .iter()
+            .filter(|v| v.release_to_seller)
+            .count() as u32;
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("vote")),
+            DisputeVotedEvent {
+                escrow_id,
+                arbiter,
+                release_to_seller,
+                votes_for,
+                threshold: quorum_config.threshold,
+            },
+        );
 
         Ok(true)
     }

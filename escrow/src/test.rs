@@ -1264,4 +1264,201 @@ mod test {
         assert!(result.is_some());
         assert_eq!(result.unwrap(), new_admin);
     }
+
+    // ─── Issue #32: DisputeVotedEvent Tests ─────────────────────────────────
+
+    /// Helper: set up an escrow in Disputed state with quorum config.
+    /// Returns (client, contract_id, escrow_id, arbiters).
+    fn setup_disputed_escrow(
+        env: &Env,
+        threshold: u32,
+    ) -> (EscrowContractClient<'_>, Address, u64, soroban_sdk::Vec<Address>) {
+        env.mock_all_auths();
+        let (client, admin, contract_id) = setup_client(env);
+
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token_admin = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        // Create 3 arbiters for quorum.
+        let arbiter_a = Address::generate(env);
+        let arbiter_b = Address::generate(env);
+        let arbiter_c = Address::generate(env);
+        let mut arbiters = soroban_sdk::Vec::new(env);
+        arbiters.push_back(arbiter_a);
+        arbiters.push_back(arbiter_b);
+        arbiters.push_back(arbiter_c);
+        client.set_quorum_config(&admin, &arbiters, &threshold);
+
+        let order_id = BytesN::from_array(env, &[11u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        client.dispute(&escrow_id, &buyer);
+
+        (client, contract_id, escrow_id, arbiters)
+    }
+
+    /// Emit DisputeVotedEvent under (escrow, "vote") after each vote mutation,
+    /// with live votes_for/threshold.
+    #[test]
+    fn test_vote_dispute_emits_dispute_voted_event() {
+        let env = Env::default();
+        let (client, contract_id, escrow_id, arbiters) =
+            setup_disputed_escrow(&env, 2); // threshold = 2
+        let arbiter = arbiters.get(0).unwrap();
+
+        client.vote_dispute(&escrow_id, &arbiter, &true);
+
+        let events = env.events().all();
+        let mut found = false;
+        for event in events.iter() {
+            let (c_id, topics, value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                let evt: crate::DisputeVotedEvent = value.try_into_val(&env).unwrap();
+                assert_eq!(evt.escrow_id, escrow_id);
+                assert_eq!(evt.arbiter, arbiter);
+                assert!(evt.release_to_seller);
+                assert_eq!(evt.votes_for, 1); // first vote for seller side
+                assert_eq!(evt.threshold, 2);
+                found = true;
+            }
+        }
+        assert!(found, "DisputeVotedEvent not found in events");
+    }
+
+    /// After a vote for buyer (release_to_seller = false), votes_for must stay 0.
+    #[test]
+    fn test_vote_dispute_emits_zero_votes_for_on_buyer_vote() {
+        let env = Env::default();
+        let (client, contract_id, escrow_id, arbiters) =
+            setup_disputed_escrow(&env, 2);
+        let arbiter = arbiters.get(0).unwrap();
+
+        client.vote_dispute(&escrow_id, &arbiter, &false); // vote for buyer
+
+        let events = env.events().all();
+        let mut found = false;
+        for event in events.iter() {
+            let (c_id, topics, value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                let evt: crate::DisputeVotedEvent = value.try_into_val(&env).unwrap();
+                assert_eq!(evt.escrow_id, escrow_id);
+                assert_eq!(evt.arbiter, arbiter);
+                assert!(!evt.release_to_seller);
+                assert_eq!(evt.votes_for, 0); // no votes for seller side
+                assert_eq!(evt.threshold, 2);
+                found = true;
+            }
+        }
+        assert!(found, "DisputeVotedEvent not found in events");
+    }
+
+    /// Quorum boundary: second seller-side vote should show votes_for = threshold.
+    #[test]
+    fn test_vote_dispute_quorum_boundary_emits_correct_tally() {
+        let env = Env::default();
+        let (client, contract_id, escrow_id, arbiters) =
+            setup_disputed_escrow(&env, 2); // threshold = 2
+
+        // First seller vote.
+        client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
+
+        // Second seller vote — reaches quorum.
+        client.vote_dispute(&escrow_id, &arbiters.get(1).unwrap(), &true);
+
+        // Find the LAST DisputeVotedEvent — it should show votes_for = 2.
+        let events = env.events().all();
+        let mut last_evt: Option<crate::DisputeVotedEvent> = None;
+        for event in events.iter() {
+            let (c_id, topics, value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                last_evt = Some(value.try_into_val(&env).unwrap());
+            }
+        }
+        let evt = last_evt.expect("DisputeVotedEvent not found in events");
+        assert_eq!(evt.escrow_id, escrow_id);
+        assert_eq!(evt.arbiter, arbiters.get(1).unwrap());
+        assert!(evt.release_to_seller);
+        assert_eq!(evt.votes_for, 2); // quorum reached
+        assert_eq!(evt.threshold, 2);
+    }
+
+    /// Each vote emits exactly one event (no duplicates, no missing).
+    #[test]
+    fn test_vote_dispute_emits_exactly_one_event_per_vote() {
+        let env = Env::default();
+        let (client, contract_id, escrow_id, arbiters) =
+            setup_disputed_escrow(&env, 3); // threshold = 3
+
+        // Vote 1: verify exactly one DisputeVotedEvent.
+        client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
+        let mut count = 0u32;
+        for event in env.events().all().iter() {
+            let (c_id, topics, _value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1, "first vote should emit exactly one DisputeVotedEvent");
+
+        // Vote 2: verify exactly one more DisputeVotedEvent.
+        client.vote_dispute(&escrow_id, &arbiters.get(1).unwrap(), &true);
+        count = 0;
+        for event in env.events().all().iter() {
+            let (c_id, topics, _value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1, "second vote should emit exactly one DisputeVotedEvent");
+
+        // Vote 3: verify exactly one more.
+        client.vote_dispute(&escrow_id, &arbiters.get(2).unwrap(), &false);
+        count = 0;
+        for event in env.events().all().iter() {
+            let (c_id, topics, _value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1, "third vote should emit exactly one DisputeVotedEvent");
+    }
 }
