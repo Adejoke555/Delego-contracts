@@ -651,14 +651,22 @@ pub struct EscrowSnapshot {
     pub release_eligible: bool,
 }
 
-/// Read-only view of the yield an escrow has accrued so far, returned by
-/// `get_accrued_yield` (issue #331).
+/// Monotonic yield snapshot returned by [`EscrowContract::get_accrued_yield`]
+/// (issue #34).
+///
+/// All inputs needed for display are included so polling UIs cannot observe
+/// decreasing yield.  `snapshot_ledger` anchors the read to a block-stable
+/// point; `held_seconds` is computed from `created_at` to that ledger's
+/// timestamp, making the result deterministic within a single ledger close.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowYieldView {
+pub struct YieldView {
     pub escrow_id: u64,
-    pub accrued_yield: i128,
-    pub apr_bps: u32,
+    pub principal: i128,
+    pub apy_bps: u32,
+    pub held_seconds: u64,
+    pub accrued: i128,
+    pub snapshot_ledger: u32,
 }
 
 /// Compact read-only escrow summary for API/indexer consumers (issue #90).
@@ -2540,13 +2548,22 @@ impl EscrowContract {
         Ok(true)
     }
 
-    /// Read-only view of the yield an escrow has accrued so far, based on
-    /// the time it has been held (issue #331). Returns zero accrued yield
-    /// when no `YieldConfig` is set. Never mutates storage.
+    /// Monotonic yield snapshot for an escrow (issue #34).
+    ///
+    /// Returns a [`YieldView`] containing every input needed to compute
+    /// display-relevant yield numbers.  `snapshot_ledger` anchors the read
+    /// to the current ledger, `held_seconds` is derived from
+    /// `created_at` to the snapshot ledger's close time, and `accrued` is
+    /// the yield at that frozen point.  Two calls within the same ledger
+    /// always return identical results; calls in different ledgers produce
+    /// monotonically increasing `held_seconds` and `accrued`.
+    ///
+    /// Returns zero yield fields when no `YieldConfig` is set.
+    /// Never mutates storage.
     ///
     /// # Errors
     /// Returns [`EscrowError::NotFound`] when no escrow exists for `escrow_id`.
-    pub fn get_accrued_yield(env: Env, escrow_id: u64) -> Result<EscrowYieldView, EscrowError> {
+    pub fn get_accrued_yield(env: Env, escrow_id: u64) -> Result<YieldView, EscrowError> {
         let key = DataKey::Escrow(escrow_id);
         let record: EscrowRecord = env
             .storage()
@@ -2558,13 +2575,18 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&DataKey::EscrowYieldConfig(escrow_id));
-        let apr_bps = yield_config.as_ref().map(|c| c.apr_bps).unwrap_or(0);
-        let (accrued_yield, _) = Self::compute_yield(&record, yield_config.as_ref(), &env);
+        let apy_bps = yield_config.as_ref().map(|c| c.apr_bps).unwrap_or(0);
+        let snapshot_ledger = env.ledger().sequence();
+        let (accrued, held_seconds) =
+            Self::compute_yield(&record, yield_config.as_ref(), &env);
 
-        Ok(EscrowYieldView {
+        Ok(YieldView {
             escrow_id,
-            accrued_yield,
-            apr_bps,
+            principal: record.amount,
+            apy_bps,
+            held_seconds,
+            accrued,
+            snapshot_ledger,
         })
     }
 
