@@ -197,6 +197,10 @@ mod test {
         let key_metadata_1: soroban_sdk::Val = DataKey::EscrowMetadata(1u64).into_val(&env);
         let key_migration: soroban_sdk::Val = DataKey::MigrationFlag.into_val(&env);
         let key_fee_dist: soroban_sdk::Val = DataKey::FeeDistribution.into_val(&env);
+        let key_require_cond_0: soroban_sdk::Val =
+            DataKey::RequireReleaseCondition(0u64).into_val(&env);
+        let key_require_cond_1: soroban_sdk::Val =
+            DataKey::RequireReleaseCondition(1u64).into_val(&env);
 
         let all_keys: &[soroban_sdk::Val] = &[
             key_admin,
@@ -217,6 +221,8 @@ mod test {
             key_metadata_1,
             key_migration,
             key_fee_dist,
+            key_require_cond_0,
+            key_require_cond_1,
         ];
 
         // Assert every key is unique by comparing raw val representations
