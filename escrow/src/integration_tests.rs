@@ -1237,6 +1237,60 @@ fn test_evaluate_and_release_without_condition_fails() {
     );
 }
 
+// ── Issue #37: checked_add for timeout_ledger computation ───────────────
+
+#[test]
+fn test_deposit_timeout_at_u32_max_boundary_succeeds() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // A small, bounded sequence keeps the contract instance live (a large jump
+    // would archive it in the test host).
+    let sequence = 100u32;
+    t.env.ledger().set_sequence_number(sequence);
+
+    // Exact boundary: sequence + timeout_ledgers == u32::MAX, must not panic.
+    let timeout_ledgers = u32::MAX - sequence;
+    let escrow_id = escrow_client.deposit(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &1000,
+        &t.order_id(),
+        &timeout_ledgers,
+        &None,
+        &None,
+    );
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.timeout_ledger, u32::MAX);
+}
+
+#[test]
+fn test_deposit_timeout_past_u32_max_returns_typed_error() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let sequence = 100u32;
+    t.env.ledger().set_sequence_number(sequence);
+
+    // One past the boundary: checked_add must return InvalidExtension, not panic.
+    let timeout_ledgers = u32::MAX - sequence + 1;
+    assert_eq!(
+        escrow_client.try_deposit(
+            &t.buyer,
+            &t.seller,
+            &t.token_contract_id,
+            &1000,
+            &t.order_id(),
+            &timeout_ledgers,
+            &None,
+            &None,
+        ),
+        Err(Ok(EscrowError::InvalidExtension))
+    );
+}
+
 // ── Issue #88: EscrowTimeoutView getter tests ────────────────────────────
 
 #[test]
