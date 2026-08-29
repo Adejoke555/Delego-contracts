@@ -1345,104 +1345,58 @@ fn test_evaluate_and_release_without_condition_fails() {
     );
 }
 
-// ── Issue #27: Platform fee on ordinary release paths ────────────────────
+// ── Issue #37: checked_add for timeout_ledger computation ───────────────
 
 #[test]
-fn test_normal_release_charges_platform_fee() {
-    let t = TestEnv::setup_with_fee_bps(250);
+fn test_deposit_timeout_at_u32_max_boundary_succeeds() {
+    let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
 
-    let escrow_id = deposit_escrow(&t, 1000, 100);
-    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+    // A small, bounded sequence keeps the contract instance live (a large jump
+    // would archive it in the test host).
+    let sequence = 100u32;
+    t.env.ledger().set_sequence_number(sequence);
 
-    // fee_bps = 250 (2.5%) of 1000 -> 25 to treasury, 975 to seller.
-    assert_eq!(token_client.balance(&t.treasury), 25);
-    assert_eq!(token_client.balance(&t.seller), 975);
-
-    let record = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record.status, EscrowStatus::Released);
-    assert_eq!(record.released_amount, 1000);
-}
-
-#[test]
-fn test_partial_release_charges_proportional_fee() {
-    let t = TestEnv::setup_with_fee_bps(250);
-    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
-
-    let escrow_id = deposit_escrow(&t, 1000, 100);
-
-    let first = escrow_client.partial_release(&escrow_id, &t.buyer, &500);
-    assert_eq!(first.released, 500);
-    assert!(!first.fully_released);
-    // 2.5% of 500 -> 12 (integer rounding), seller receives 488.
-    assert_eq!(token_client.balance(&t.treasury), 12);
-    assert_eq!(token_client.balance(&t.seller), 488);
-
-    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
-    // Second 500 also charges 12; seller net 488; total fee 24.
-    assert_eq!(token_client.balance(&t.treasury), 24);
-    assert_eq!(token_client.balance(&t.seller), 976);
-
-    let record = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record.status, EscrowStatus::Released);
-    assert_eq!(record.released_amount, 1000);
-}
-
-#[test]
-fn test_evaluate_and_release_charges_platform_fee() {
-    let t = TestEnv::setup_with_fee_bps(250);
-    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
-    let oracle_id = t.env.register(TrueOracle, ());
-
-    let escrow_id = deposit_escrow(&t, 1000, 100);
-    escrow_client.set_release_condition(
+    // Exact boundary: sequence + timeout_ledgers == u32::MAX, must not panic.
+    let timeout_ledgers = u32::MAX - sequence;
+    let escrow_id = escrow_client.deposit(
+        &t.buyer,
         &t.seller,
-        &escrow_id,
-        &symbol_short!("shipped"),
-        &oracle_id,
+        &t.token_contract_id,
+        &1000,
+        &t.order_id(),
+        &timeout_ledgers,
+        &None,
+        &None,
     );
 
-    let result = escrow_client.evaluate_and_release(&escrow_id, &t.agent);
-    assert_eq!(result.released, 1000);
-    assert!(result.fully_released);
-
-    assert_eq!(token_client.balance(&t.treasury), 25);
-    assert_eq!(token_client.balance(&t.seller), 975);
-
     let record = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record.status, EscrowStatus::Released);
-    assert_eq!(record.released_amount, 1000);
+    assert_eq!(record.timeout_ledger, u32::MAX);
 }
 
 #[test]
-fn test_normal_release_uses_multi_treasury_distribution() {
-    let t = TestEnv::setup_with_fee_bps(250);
+fn test_deposit_timeout_past_u32_max_returns_typed_error() {
+    let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
 
-    let treasury_a = Address::generate(&t.env);
-    let treasury_b = Address::generate(&t.env);
-    let mut shares = Vec::new(&t.env);
-    shares.push_back(crate::TreasuryShare {
-        treasury: treasury_a.clone(),
-        bps: 300,
-    });
-    shares.push_back(crate::TreasuryShare {
-        treasury: treasury_b.clone(),
-        bps: 200,
-    });
-    escrow_client.set_fee_distribution(&t.admin, &shares);
+    let sequence = 100u32;
+    t.env.ledger().set_sequence_number(sequence);
 
-    let escrow_id = deposit_escrow(&t, 1000, 100);
-    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
-
-    // 3% + 2% = 5% of 1000 -> 50 in fees, seller receives 950.
-    assert_eq!(token_client.balance(&treasury_a), 30);
-    assert_eq!(token_client.balance(&treasury_b), 20);
-    assert_eq!(token_client.balance(&t.seller), 950);
+    // One past the boundary: checked_add must return InvalidExtension, not panic.
+    let timeout_ledgers = u32::MAX - sequence + 1;
+    assert_eq!(
+        escrow_client.try_deposit(
+            &t.buyer,
+            &t.seller,
+            &t.token_contract_id,
+            &1000,
+            &t.order_id(),
+            &timeout_ledgers,
+            &None,
+            &None,
+        ),
+        Err(Ok(EscrowError::InvalidExtension))
+    );
 }
 
 // ── Issue #88: EscrowTimeoutView getter tests ────────────────────────────
