@@ -842,7 +842,7 @@ fn test_version_callable_without_auth() {
 
     let version = client.version();
     assert_eq!(version.name, symbol_short!("escrow"));
-    assert_eq!(version.semver, symbol_short!("0_1_0"));
+    assert_eq!(version.semver, symbol_short!("0_2_0"));
 }
 
 // ── Partial release tests ──────────────────────────────────────────────────

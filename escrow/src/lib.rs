@@ -71,6 +71,7 @@ pub struct EscrowRecord {
     pub status: EscrowStatus,
     pub order_id: BytesN<32>,
     pub created_at: u64,
+    pub updated_at: u64,
     pub timeout_ledger: u32,
 }
 
@@ -761,7 +762,7 @@ impl EscrowContract {
     pub fn version(_env: Env) -> ContractVersion {
         ContractVersion {
             name: symbol_short!("escrow"),
-            semver: symbol_short!("0_1_0"),
+            semver: symbol_short!("0_2_0"),
         }
     }
 
@@ -1054,6 +1055,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Refunded;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -1137,6 +1139,7 @@ impl EscrowContract {
         let previous_timeout_ledger = record.timeout_ledger;
         let new_timeout_ledger = previous_timeout_ledger.saturating_add(extension_ledgers);
         record.timeout_ledger = new_timeout_ledger;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().remove(&votes_key);
 
@@ -1499,6 +1502,7 @@ impl EscrowContract {
 
         record.released_amount = record.amount;
         record.status = EscrowStatus::Released;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -1631,6 +1635,7 @@ impl EscrowContract {
             status: EscrowStatus::Created,
             order_id: order_id.clone(),
             created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
             timeout_ledger,
         };
 
@@ -1703,6 +1708,7 @@ impl EscrowContract {
         token_client.transfer(&buyer, &env.current_contract_address(), &record.amount);
 
         record.status = EscrowStatus::Funded;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         Ok(true)
@@ -1741,6 +1747,7 @@ impl EscrowContract {
         }
 
         record.status = EscrowStatus::Cancelled;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -1825,6 +1832,7 @@ impl EscrowContract {
         token_client.transfer(&buyer, &env.current_contract_address(), &amount);
 
         record.status = EscrowStatus::Funded;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         Ok(escrow_id)
@@ -2003,6 +2011,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Released;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(key, &record);
 
         env.events().publish(
@@ -2149,6 +2158,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Refunded;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -2303,6 +2313,7 @@ impl EscrowContract {
         }
 
         record.status = EscrowStatus::Disputed;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -2359,6 +2370,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Refunded;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -3125,6 +3137,7 @@ impl EscrowContract {
         if new_remaining == 0 {
             record.status = EscrowStatus::Released;
         }
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -3180,6 +3193,7 @@ impl EscrowContract {
 
         let old_timeout = record.timeout_ledger;
         record.timeout_ledger = new_timeout_ledger;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
