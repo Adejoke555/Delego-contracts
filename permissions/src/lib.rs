@@ -21,6 +21,12 @@ pub const CONTRACT_SEMVER: &str = "0_1_0";
 /// costs unexpectedly.
 pub const MAX_MERCHANTS_PER_PERMISSION: u32 = 25;
 
+/// Upper bound on the velocity limit's minimum-spend-interval, in ledgers.
+/// At ~5s per ledger this is roughly one year; anything above this would
+/// effectively disable spending forever with no clear signal, so it is
+/// rejected outright.
+pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -72,6 +78,8 @@ pub enum PermissionError {
     PendingDecreaseExists = 408,
     /// Time-lock on pending allowance decrease has not elapsed yet
     TimeLockActive = 409,
+    /// Admin-gated call made before `set_admin` has ever been called
+    NotInitialized = 500,
 }
 
 #[contracttype]
@@ -315,7 +323,8 @@ pub struct AllowanceIncreasedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct VelocityLimitSetEvent {
-    pub min_spend_interval: u32,
+    pub previous: Option<u32>,
+    pub current: u32,
     pub set_by: Address,
 }
 
@@ -338,6 +347,21 @@ pub struct PermissionExpiryCappedEvent {
     pub owner: Address,
     pub delegate: Address,
     pub capped_at: u32,
+/// Emitted by `propose_admin` when the current admin proposes a successor
+/// as part of the two-step admin transfer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AdminProposedEvent {
+    pub current_admin: Address,
+    pub new_admin: Address,
+}
+
+/// Emitted by `accept_admin` once the proposed successor accepts the role.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AdminAcceptedEvent {
+    pub previous_admin: Address,
+    pub new_admin: Address,
 }
 
 /// A single entry in the on-chain audit log for a (owner, delegate) pair.
@@ -363,6 +387,26 @@ pub struct DelegateStatusView {
     pub active: bool,
     pub reason: Symbol,
     pub remaining: i128,
+}
+
+/// Status view that surfaces `PermissionStatus` explicitly rather than only
+/// a derived `active`/`reason` pair, so callers can distinguish e.g.
+/// "revoked" from "no budget left" without relying on `reason` string
+/// matching.
+///
+/// `remaining` is `0` for every non-`Active` state (matching
+/// `DelegateStatusView`'s existing convention) — it does not reflect the
+/// permission's underlying allowance once it is no longer spendable.
+/// `expires_at_ledger` is always the record's stored expiry regardless of
+/// status, or `0` when no permission record exists for this pair.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegateStatusV2 {
+    pub owner: Address,
+    pub delegate: Address,
+    pub status: PermissionStatus,
+    pub remaining: i128,
+    pub expires_at_ledger: u32,
 }
 
 ///
@@ -414,6 +458,25 @@ pub struct PermissionUsageStats {
     pub last_spend_ledger: u32,
 }
 
+/// Non-truncating usage telemetry view (issue: add spend-count and
+/// BPS-denominated average to usage stats).
+///
+/// `average_spent_bps` is `total_spent * 10_000 / spend_count`, i.e. the
+/// average spend amount expressed in basis points of a single unit, which
+/// preserves precision that plain integer-division of `average_spend`
+/// would otherwise round away for small or skewed spend counts. Both this
+/// and `average_spend` use truncating integer division; callers needing
+/// the exact fractional remainder should derive it from `total_spent` and
+/// `spend_count` directly.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageStatsView {
+    pub spend_count: u64,
+    pub total_spent: i128,
+    pub average_spent_bps: u64,
+    pub last_spend_ledger: Option<u32>,
+}
+
 /// Tracks the total spent amount and most recent spend ledger for audit and freshness checks.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -431,6 +494,14 @@ pub struct MerchantRestriction {
     pub owner: Address,
     pub delegate: Address,
     pub merchant: Option<Address>,
+}
+
+/// Full merchant whitelist for a delegation pair, bounded by
+/// `MAX_MERCHANTS_PER_PERMISSION`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRestrictionView {
+    pub merchants: Vec<Address>,
 }
 
 #[contracttype]
@@ -970,6 +1041,23 @@ impl PermissionsContract {
         );
 
         Ok(())
+    }
+
+    /// Requires that `caller` is authorized and matches the stored admin.
+    /// Returns `PermissionError::NotInitialized` (never panics) if
+    /// `set_admin` has not yet been called, and `Unauthorized` if `caller`
+    /// is not the stored admin.
+    fn require_admin(env: &Env, caller: &Address) -> Result<Address, PermissionError> {
+        caller.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PermissionError::NotInitialized)?;
+        if *caller != stored_admin {
+            return Err(PermissionError::Unauthorized);
+        }
+        Ok(stored_admin)
     }
 
     /// Validates the merchant whitelist:
@@ -1778,13 +1866,23 @@ impl PermissionsContract {
         record.status = PermissionStatus::Paused;
         env.storage().persistent().set(&perm_key, &record);
 
+        let reason_code = symbol_short!("none");
+        env.storage().persistent().set(
+            &DataKey::PauseMetadata(owner.clone(), delegate.clone()),
+            &PauseMetadata {
+                paused_by: owner.clone(),
+                reason_code,
+                paused_at_ledger: env.ledger().sequence(),
+            },
+        );
+
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("paused")),
             PermissionPausedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
                 paused_by: owner.clone(),
-                reason_code: symbol_short!("none"),
+                reason_code,
             },
         );
 
@@ -1814,6 +1912,9 @@ impl PermissionsContract {
 
         record.status = PermissionStatus::Active;
         env.storage().persistent().set(&perm_key, &record);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PauseMetadata(owner.clone(), delegate.clone()));
 
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("resumed")),
@@ -1835,12 +1936,18 @@ impl PermissionsContract {
         Ok(())
     }
 
-    /// Returns the stored pause metadata, or panics if the permission is not currently paused.
-    pub fn get_pause_metadata(env: Env, owner: Address, delegate: Address) -> PauseMetadata {
-        env.storage()
+    /// Returns the stored pause metadata for `(owner, delegate)`, or `Ok(None)`
+    /// when the permission is not currently paused (never panics on a missing
+    /// entry).
+    pub fn get_pause_metadata(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<Option<PauseMetadata>, PermissionError> {
+        Ok(env
+            .storage()
             .persistent()
-            .get(&DataKey::PauseMetadata(owner, delegate))
-            .unwrap()
+            .get(&DataKey::PauseMetadata(owner, delegate)))
     }
 
     pub fn set_admin(env: Env, admin: Address) {
@@ -1871,6 +1978,15 @@ impl PermissionsContract {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("adm_prop")),
+            AdminProposedEvent {
+                current_admin: caller,
+                new_admin,
+            },
+        );
+
         Ok(())
     }
 
@@ -1886,22 +2002,28 @@ impl PermissionsContract {
         if caller != pending {
             return Err(PermissionError::Unauthorized);
         }
+        let previous_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PermissionError::NotFound)?;
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("adm_acc")),
+            AdminAcceptedEvent {
+                previous_admin,
+                new_admin: caller,
+            },
+        );
+
         Ok(())
     }
 
     /// Pause new grant creation. Admin-only.
     pub fn pause_grants(env: Env, admin: Address) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         let state = PermissionPauseState {
             grants_paused: true,
@@ -1925,15 +2047,7 @@ impl PermissionsContract {
 
     /// Unpause new grant creation. Admin-only.
     pub fn unpause_grants(env: Env, admin: Address) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         let state = PermissionPauseState {
             grants_paused: false,
@@ -1973,15 +2087,7 @@ impl PermissionsContract {
         admin: Address,
         threshold_seconds: u64,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
         if threshold_seconds == 0 {
             return Err(PermissionError::InvalidParam);
         }
@@ -2110,15 +2216,13 @@ impl PermissionsContract {
         admin: Address,
         interval: u32,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
+        Self::require_admin(&env, &admin)?;
+
+        if interval > MAX_VELOCITY_INTERVAL {
+            return Err(PermissionError::InvalidParam);
         }
+
+        let previous: Option<u32> = env.storage().instance().get(&DataKey::MinSpendInterval);
 
         env.storage()
             .instance()
@@ -2127,7 +2231,8 @@ impl PermissionsContract {
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("velset")),
             VelocityLimitSetEvent {
-                min_spend_interval: interval,
+                previous,
+                current: interval,
                 set_by: admin,
             },
         );
@@ -2158,15 +2263,7 @@ impl PermissionsContract {
         admin: Address,
         allow: bool,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
         env.storage()
             .instance()
             .set(&DataKey::AllowSelfDelegation, &allow);
@@ -2179,15 +2276,7 @@ impl PermissionsContract {
         admin: Address,
         schema: Symbol,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         let mut registry: Vec<Symbol> = env
             .storage()
@@ -2298,6 +2387,22 @@ impl PermissionsContract {
         })
     }
 
+    /// Returns the full whitelisted-merchant list for a delegation pair,
+    /// bounded by `MAX_MERCHANTS_PER_PERMISSION`. Returns `None` when no
+    /// permission record exists; an empty `Vec` when the record exists but
+    /// has no merchant restriction configured.
+    pub fn get_merchant_restrictions(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<MerchantRestrictionView> {
+        let key = DataKey::Permission(owner, delegate);
+        let record: PermissionRecord = env.storage().persistent().get(&key)?;
+        Some(MerchantRestrictionView {
+            merchants: record.allowed_merchants,
+        })
+    }
+
     /// Returns a compact receipt for an existing permission grant (issue #180).
     /// Includes active status derived from stored state and current ledger.
     pub fn get_receipt(
@@ -2338,6 +2443,40 @@ impl PermissionsContract {
                 first_spend_ledger: 0,
                 last_spend_ledger: 0,
             })
+    }
+
+    /// Returns non-truncating usage telemetry for a (owner, delegate)
+    /// delegation, including a BPS-denominated average spend that avoids
+    /// the coarse rounding plain integer division produces on
+    /// `PermissionUsageStats::average_spend`. A pair with no recorded
+    /// spends returns zeroed stats with `last_spend_ledger: None`.
+    pub fn get_usage_stats_bps(env: Env, owner: Address, delegate: Address) -> UsageStatsView {
+        let stats = Self::get_usage_stats(env, owner, delegate);
+
+        let average_spent_bps = if stats.total_spends == 0 {
+            0
+        } else {
+            let total_spent_u = if stats.total_spent < 0 {
+                0i128
+            } else {
+                stats.total_spent
+            };
+            total_spent_u
+                .saturating_mul(10_000)
+                .checked_div(stats.total_spends as i128)
+                .unwrap_or(0) as u64
+        };
+
+        UsageStatsView {
+            spend_count: stats.total_spends,
+            total_spent: stats.total_spent,
+            average_spent_bps,
+            last_spend_ledger: if stats.total_spends == 0 {
+                None
+            } else {
+                Some(stats.last_spend_ledger)
+            },
+        }
     }
 
     /// Returns the total spent amount and the ledger sequence of the most
@@ -2444,6 +2583,45 @@ impl PermissionsContract {
             reason: Symbol::new(&env, "active"),
             remaining,
         }
+    }
+
+    /// Like `get_delegate_status`, but surfaces `PermissionStatus` directly
+    /// instead of a derived `active`/`reason` pair — so a `Revoked`
+    /// permission is distinguishable from an `Expired` one without string
+    /// matching on `reason`.
+    pub fn get_delegate_status_v2(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<DelegateStatusV2> {
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let record: PermissionRecord = env.storage().persistent().get(&key)?;
+
+        let is_expired = env.ledger().sequence() >= record.expires_at_ledger;
+        let effective_status = if is_expired && record.status == PermissionStatus::Active {
+            PermissionStatus::Expired
+        } else {
+            record.status.clone()
+        };
+
+        let remaining = if effective_status == PermissionStatus::Active {
+            let raw = record.limit_total - record.spent;
+            if raw < 0 {
+                0
+            } else {
+                raw
+            }
+        } else {
+            0
+        };
+
+        Some(DelegateStatusV2 {
+            owner,
+            delegate,
+            status: effective_status,
+            remaining,
+            expires_at_ledger: record.expires_at_ledger,
+        })
     }
 
     /// Quick-check whether a permission is currently active (exists, has
