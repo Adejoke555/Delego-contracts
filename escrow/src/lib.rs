@@ -2580,9 +2580,11 @@ impl EscrowContract {
         let (accrued, held_seconds) =
             Self::compute_yield(&record, yield_config.as_ref(), &env);
 
+        let remaining = record.amount - record.released_amount;
+
         Ok(YieldView {
             escrow_id,
-            principal: record.amount,
+            principal: remaining,
             apy_bps,
             held_seconds,
             accrued,
@@ -3015,8 +3017,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Computes yield accrued on an escrow's principal for the time it has
-    /// been held, based on the given `YieldConfig` APR. Returns
+    /// Computes yield accrued on an escrow's remaining principal for the time
+    /// it has been held, based on the given `YieldConfig` APR.  The principal
+    /// is `record.amount - record.released_amount` so partially released
+    /// escrows report honest yield (issue #33).  Returns
     /// `(yield_amount, held_seconds)`; `(0, 0)` when no yield config is set.
     fn compute_yield(
         record: &EscrowRecord,
@@ -3026,7 +3030,8 @@ impl EscrowContract {
         match yield_config {
             Some(cfg) => {
                 let held_seconds = env.ledger().timestamp().saturating_sub(record.created_at);
-                let yield_amount = (record.amount * cfg.apr_bps as i128 * held_seconds as i128)
+                let remaining = record.amount - record.released_amount;
+                let yield_amount = (remaining * cfg.apr_bps as i128 * held_seconds as i128)
                     / (10_000i128 * SECONDS_PER_YEAR);
                 (yield_amount, held_seconds)
             }
