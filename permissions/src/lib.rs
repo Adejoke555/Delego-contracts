@@ -72,6 +72,8 @@ pub enum PermissionError {
     PendingDecreaseExists = 408,
     /// Time-lock on pending allowance decrease has not elapsed yet
     TimeLockActive = 409,
+    /// Admin-gated call made before `set_admin` has ever been called
+    NotInitialized = 500,
 }
 
 #[contracttype]
@@ -354,6 +356,26 @@ pub struct DelegateStatusView {
     pub remaining: i128,
 }
 
+/// Status view that surfaces `PermissionStatus` explicitly rather than only
+/// a derived `active`/`reason` pair, so callers can distinguish e.g.
+/// "revoked" from "no budget left" without relying on `reason` string
+/// matching.
+///
+/// `remaining` is `0` for every non-`Active` state (matching
+/// `DelegateStatusView`'s existing convention) — it does not reflect the
+/// permission's underlying allowance once it is no longer spendable.
+/// `expires_at_ledger` is always the record's stored expiry regardless of
+/// status, or `0` when no permission record exists for this pair.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegateStatusV2 {
+    pub owner: Address,
+    pub delegate: Address,
+    pub status: PermissionStatus,
+    pub remaining: i128,
+    pub expires_at_ledger: u32,
+}
+
 ///
 /// `allowed`       – true when all validation rules would pass.
 /// `reason`        – short code describing the outcome:
@@ -420,6 +442,14 @@ pub struct MerchantRestriction {
     pub owner: Address,
     pub delegate: Address,
     pub merchant: Option<Address>,
+}
+
+/// Full merchant whitelist for a delegation pair, bounded by
+/// `MAX_MERCHANTS_PER_PERMISSION`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRestrictionView {
+    pub merchants: Vec<Address>,
 }
 
 #[contracttype]
@@ -945,6 +975,23 @@ impl PermissionsContract {
         );
 
         Ok(())
+    }
+
+    /// Requires that `caller` is authorized and matches the stored admin.
+    /// Returns `PermissionError::NotInitialized` (never panics) if
+    /// `set_admin` has not yet been called, and `Unauthorized` if `caller`
+    /// is not the stored admin.
+    fn require_admin(env: &Env, caller: &Address) -> Result<Address, PermissionError> {
+        caller.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PermissionError::NotInitialized)?;
+        if *caller != stored_admin {
+            return Err(PermissionError::Unauthorized);
+        }
+        Ok(stored_admin)
     }
 
     /// Validates the merchant whitelist:
@@ -1691,13 +1738,23 @@ impl PermissionsContract {
         record.status = PermissionStatus::Paused;
         env.storage().persistent().set(&perm_key, &record);
 
+        let reason_code = symbol_short!("none");
+        env.storage().persistent().set(
+            &DataKey::PauseMetadata(owner.clone(), delegate.clone()),
+            &PauseMetadata {
+                paused_by: owner.clone(),
+                reason_code,
+                paused_at_ledger: env.ledger().sequence(),
+            },
+        );
+
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("paused")),
             PermissionPausedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
                 paused_by: owner.clone(),
-                reason_code: symbol_short!("none"),
+                reason_code,
             },
         );
 
@@ -1727,6 +1784,9 @@ impl PermissionsContract {
 
         record.status = PermissionStatus::Active;
         env.storage().persistent().set(&perm_key, &record);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PauseMetadata(owner.clone(), delegate.clone()));
 
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("resumed")),
@@ -1748,12 +1808,18 @@ impl PermissionsContract {
         Ok(())
     }
 
-    /// Returns the stored pause metadata, or panics if the permission is not currently paused.
-    pub fn get_pause_metadata(env: Env, owner: Address, delegate: Address) -> PauseMetadata {
-        env.storage()
+    /// Returns the stored pause metadata for `(owner, delegate)`, or `Ok(None)`
+    /// when the permission is not currently paused (never panics on a missing
+    /// entry).
+    pub fn get_pause_metadata(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<Option<PauseMetadata>, PermissionError> {
+        Ok(env
+            .storage()
             .persistent()
-            .get(&DataKey::PauseMetadata(owner, delegate))
-            .unwrap()
+            .get(&DataKey::PauseMetadata(owner, delegate)))
     }
 
     pub fn set_admin(env: Env, admin: Address) {
@@ -1806,15 +1872,7 @@ impl PermissionsContract {
 
     /// Pause new grant creation. Admin-only.
     pub fn pause_grants(env: Env, admin: Address) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         let state = PermissionPauseState {
             grants_paused: true,
@@ -1838,15 +1896,7 @@ impl PermissionsContract {
 
     /// Unpause new grant creation. Admin-only.
     pub fn unpause_grants(env: Env, admin: Address) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         let state = PermissionPauseState {
             grants_paused: false,
@@ -1886,15 +1936,7 @@ impl PermissionsContract {
         admin: Address,
         threshold_seconds: u64,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
         if threshold_seconds == 0 {
             return Err(PermissionError::InvalidParam);
         }
@@ -1982,15 +2024,7 @@ impl PermissionsContract {
         admin: Address,
         interval: u32,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         env.storage()
             .instance()
@@ -2030,15 +2064,7 @@ impl PermissionsContract {
         admin: Address,
         allow: bool,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
         env.storage()
             .instance()
             .set(&DataKey::AllowSelfDelegation, &allow);
@@ -2051,15 +2077,7 @@ impl PermissionsContract {
         admin: Address,
         schema: Symbol,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         let mut registry: Vec<Symbol> = env
             .storage()
@@ -2167,6 +2185,22 @@ impl PermissionsContract {
             owner,
             delegate,
             merchant,
+        })
+    }
+
+    /// Returns the full whitelisted-merchant list for a delegation pair,
+    /// bounded by `MAX_MERCHANTS_PER_PERMISSION`. Returns `None` when no
+    /// permission record exists; an empty `Vec` when the record exists but
+    /// has no merchant restriction configured.
+    pub fn get_merchant_restrictions(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<MerchantRestrictionView> {
+        let key = DataKey::Permission(owner, delegate);
+        let record: PermissionRecord = env.storage().persistent().get(&key)?;
+        Some(MerchantRestrictionView {
+            merchants: record.allowed_merchants,
         })
     }
 
@@ -2316,6 +2350,45 @@ impl PermissionsContract {
             reason: Symbol::new(&env, "active"),
             remaining,
         }
+    }
+
+    /// Like `get_delegate_status`, but surfaces `PermissionStatus` directly
+    /// instead of a derived `active`/`reason` pair — so a `Revoked`
+    /// permission is distinguishable from an `Expired` one without string
+    /// matching on `reason`.
+    pub fn get_delegate_status_v2(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<DelegateStatusV2> {
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let record: PermissionRecord = env.storage().persistent().get(&key)?;
+
+        let is_expired = env.ledger().sequence() >= record.expires_at_ledger;
+        let effective_status = if is_expired && record.status == PermissionStatus::Active {
+            PermissionStatus::Expired
+        } else {
+            record.status.clone()
+        };
+
+        let remaining = if effective_status == PermissionStatus::Active {
+            let raw = record.limit_total - record.spent;
+            if raw < 0 {
+                0
+            } else {
+                raw
+            }
+        } else {
+            0
+        };
+
+        Some(DelegateStatusV2 {
+            owner,
+            delegate,
+            status: effective_status,
+            remaining,
+            expires_at_ledger: record.expires_at_ledger,
+        })
     }
 
     /// Quick-check whether a permission is currently active (exists, has
