@@ -134,6 +134,23 @@ fn test_already_initialized_returns_typed_error() {
 }
 
 #[test]
+fn test_get_admin_returns_admin_address() {
+    let (_, client, admin, _, _, _) = setup();
+
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+#[should_panic(expected = "Admin not set")]
+fn test_get_admin_panics_when_not_initialized() {
+    let env = Env::default();
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+
+    client.get_admin();
+}
+
+#[test]
 fn test_rollback_before_version_1_returns_typed_error() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
