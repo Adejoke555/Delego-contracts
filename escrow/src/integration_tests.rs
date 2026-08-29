@@ -1616,10 +1616,43 @@ fn test_settle_from_pool_transfers_to_seller() {
     assert_eq!(record.status, EscrowStatus::Released);
     assert_eq!(record.released_amount, 1000);
 
-    // Pool balance is unaffected: the seller's payout is backed by this
-    // escrow's own now-settled deposit rather than draining the reserve.
+    // Pool balance is debited by the settled amount, mirroring the real
+    // token movement out of the reserve.
     let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
-    assert_eq!(pool.balance, 5000);
+    assert_eq!(pool.balance, 4000);
+}
+
+#[test]
+fn test_settle_from_pool_decrements_balance_and_blocks_overcommit() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let funder = Address::generate(&t.env);
+    let token_admin_client =
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token_contract_id);
+    token_admin_client.mint(&funder, &5000);
+    escrow_client.fund_pool(&funder, &t.token_contract_id, &5000);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    assert!(escrow_client.settle_from_pool(&escrow_id, &t.admin));
+
+    // Balance drops by exactly the settled amount.
+    assert_eq!(
+        escrow_client
+            .get_liquidity_pool(&t.token_contract_id)
+            .balance,
+        4000
+    );
+
+    // The remaining balance can still be withdrawn, but over-committing
+    // beyond it is rejected.
+    assert_eq!(
+        escrow_client.try_withdraw_from_pool(&t.admin, &t.token_contract_id, &4001),
+        Err(Ok(EscrowError::InsufficientPoolBalance))
+    );
+
+    let remaining_balance = escrow_client.withdraw_from_pool(&t.admin, &t.token_contract_id, &4000);
+    assert_eq!(remaining_balance, 0);
 }
 
 #[test]
