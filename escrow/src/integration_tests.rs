@@ -16,12 +16,17 @@ struct TestEnv {
     buyer: Address,
     seller: Address,
     agent: Address,
+    treasury: Address,
     token_contract_id: Address,
     escrow_contract_id: Address,
 }
 
 impl TestEnv {
     fn setup() -> Self {
+        Self::setup_with_fee_bps(0)
+    }
+
+    fn setup_with_fee_bps(fee_bps: u32) -> Self {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -41,7 +46,6 @@ impl TestEnv {
 
         let escrow_contract_id = env.register(EscrowContract, ());
         let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
-        let fee_bps = 0u32; // 0% for tests
         let min_amount = 100i128;
         let max_amount = 10000i128;
         escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
@@ -53,6 +57,7 @@ impl TestEnv {
             buyer,
             seller,
             agent,
+            treasury,
             token_contract_id,
             escrow_contract_id,
         }
@@ -1338,6 +1343,106 @@ fn test_evaluate_and_release_without_condition_fails() {
         escrow_client.try_evaluate_and_release(&escrow_id, &t.agent),
         Err(Ok(EscrowError::ReleaseConditionNotSet))
     );
+}
+
+// ── Issue #27: Platform fee on ordinary release paths ────────────────────
+
+#[test]
+fn test_normal_release_charges_platform_fee() {
+    let t = TestEnv::setup_with_fee_bps(250);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+
+    // fee_bps = 250 (2.5%) of 1000 -> 25 to treasury, 975 to seller.
+    assert_eq!(token_client.balance(&t.treasury), 25);
+    assert_eq!(token_client.balance(&t.seller), 975);
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Released);
+    assert_eq!(record.released_amount, 1000);
+}
+
+#[test]
+fn test_partial_release_charges_proportional_fee() {
+    let t = TestEnv::setup_with_fee_bps(250);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    let first = escrow_client.partial_release(&escrow_id, &t.buyer, &500);
+    assert_eq!(first.released, 500);
+    assert!(!first.fully_released);
+    // 2.5% of 500 -> 12 (integer rounding), seller receives 488.
+    assert_eq!(token_client.balance(&t.treasury), 12);
+    assert_eq!(token_client.balance(&t.seller), 488);
+
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+    // Second 500 also charges 12; seller net 488; total fee 24.
+    assert_eq!(token_client.balance(&t.treasury), 24);
+    assert_eq!(token_client.balance(&t.seller), 976);
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Released);
+    assert_eq!(record.released_amount, 1000);
+}
+
+#[test]
+fn test_evaluate_and_release_charges_platform_fee() {
+    let t = TestEnv::setup_with_fee_bps(250);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let oracle_id = t.env.register(TrueOracle, ());
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    escrow_client.set_release_condition(
+        &t.seller,
+        &escrow_id,
+        &symbol_short!("shipped"),
+        &oracle_id,
+    );
+
+    let result = escrow_client.evaluate_and_release(&escrow_id, &t.agent);
+    assert_eq!(result.released, 1000);
+    assert!(result.fully_released);
+
+    assert_eq!(token_client.balance(&t.treasury), 25);
+    assert_eq!(token_client.balance(&t.seller), 975);
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Released);
+    assert_eq!(record.released_amount, 1000);
+}
+
+#[test]
+fn test_normal_release_uses_multi_treasury_distribution() {
+    let t = TestEnv::setup_with_fee_bps(250);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let treasury_a = Address::generate(&t.env);
+    let treasury_b = Address::generate(&t.env);
+    let mut shares = Vec::new(&t.env);
+    shares.push_back(crate::TreasuryShare {
+        treasury: treasury_a.clone(),
+        bps: 300,
+    });
+    shares.push_back(crate::TreasuryShare {
+        treasury: treasury_b.clone(),
+        bps: 200,
+    });
+    escrow_client.set_fee_distribution(&t.admin, &shares);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+
+    // 3% + 2% = 5% of 1000 -> 50 in fees, seller receives 950.
+    assert_eq!(token_client.balance(&treasury_a), 30);
+    assert_eq!(token_client.balance(&treasury_b), 20);
+    assert_eq!(token_client.balance(&t.seller), 950);
 }
 
 // ── Issue #88: EscrowTimeoutView getter tests ────────────────────────────
