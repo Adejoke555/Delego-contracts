@@ -1682,7 +1682,9 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::LastEscrowId, &last_id);
 
-        let timeout_ledger = env.ledger().sequence() + timeout_ledgers;
+        let timeout_ledger = timeout_ledgers
+            .checked_add(env.ledger().sequence())
+            .ok_or(EscrowError::InvalidExtension)?;
         let record = EscrowRecord {
             escrow_id: last_id,
             buyer: buyer.clone(),
