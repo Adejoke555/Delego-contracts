@@ -21,6 +21,12 @@ pub const CONTRACT_SEMVER: &str = "0_1_0";
 /// costs unexpectedly.
 pub const MAX_MERCHANTS_PER_PERMISSION: u32 = 25;
 
+/// Upper bound on the velocity limit's minimum-spend-interval, in ledgers.
+/// At ~5s per ledger this is roughly one year; anything above this would
+/// effectively disable spending forever with no clear signal, so it is
+/// rejected outright.
+pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -315,7 +321,8 @@ pub struct AllowanceIncreasedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct VelocityLimitSetEvent {
-    pub min_spend_interval: u32,
+    pub previous: Option<u32>,
+    pub current: u32,
     pub set_by: Address,
 }
 
@@ -327,6 +334,23 @@ pub struct PermissionExpiryUpdatedEvent {
     pub delegate: Address,
     pub old_expiry: u32,
     pub new_expiry: u32,
+}
+
+/// Emitted by `propose_admin` when the current admin proposes a successor
+/// as part of the two-step admin transfer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AdminProposedEvent {
+    pub current_admin: Address,
+    pub new_admin: Address,
+}
+
+/// Emitted by `accept_admin` once the proposed successor accepts the role.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AdminAcceptedEvent {
+    pub previous_admin: Address,
+    pub new_admin: Address,
 }
 
 /// A single entry in the on-chain audit log for a (owner, delegate) pair.
@@ -401,6 +425,25 @@ pub struct PermissionUsageStats {
     pub largest_spend: i128,
     pub first_spend_ledger: u32,
     pub last_spend_ledger: u32,
+}
+
+/// Non-truncating usage telemetry view (issue: add spend-count and
+/// BPS-denominated average to usage stats).
+///
+/// `average_spent_bps` is `total_spent * 10_000 / spend_count`, i.e. the
+/// average spend amount expressed in basis points of a single unit, which
+/// preserves precision that plain integer-division of `average_spend`
+/// would otherwise round away for small or skewed spend counts. Both this
+/// and `average_spend` use truncating integer division; callers needing
+/// the exact fractional remainder should derive it from `total_spent` and
+/// `spend_count` directly.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageStatsView {
+    pub spend_count: u64,
+    pub total_spent: i128,
+    pub average_spent_bps: u64,
+    pub last_spend_ledger: Option<u32>,
 }
 
 /// Tracks the total spent amount and most recent spend ledger for audit and freshness checks.
@@ -1784,6 +1827,15 @@ impl PermissionsContract {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("adm_prop")),
+            AdminProposedEvent {
+                current_admin: caller,
+                new_admin,
+            },
+        );
+
         Ok(())
     }
 
@@ -1799,8 +1851,22 @@ impl PermissionsContract {
         if caller != pending {
             return Err(PermissionError::Unauthorized);
         }
+        let previous_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PermissionError::NotFound)?;
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("adm_acc")),
+            AdminAcceptedEvent {
+                previous_admin,
+                new_admin: caller,
+            },
+        );
+
         Ok(())
     }
 
@@ -1992,6 +2058,12 @@ impl PermissionsContract {
             return Err(PermissionError::Unauthorized);
         }
 
+        if interval > MAX_VELOCITY_INTERVAL {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let previous: Option<u32> = env.storage().instance().get(&DataKey::MinSpendInterval);
+
         env.storage()
             .instance()
             .set(&DataKey::MinSpendInterval, &interval);
@@ -1999,7 +2071,8 @@ impl PermissionsContract {
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("velset")),
             VelocityLimitSetEvent {
-                min_spend_interval: interval,
+                previous,
+                current: interval,
                 set_by: admin,
             },
         );
@@ -2210,6 +2283,40 @@ impl PermissionsContract {
                 first_spend_ledger: 0,
                 last_spend_ledger: 0,
             })
+    }
+
+    /// Returns non-truncating usage telemetry for a (owner, delegate)
+    /// delegation, including a BPS-denominated average spend that avoids
+    /// the coarse rounding plain integer division produces on
+    /// `PermissionUsageStats::average_spend`. A pair with no recorded
+    /// spends returns zeroed stats with `last_spend_ledger: None`.
+    pub fn get_usage_stats_bps(env: Env, owner: Address, delegate: Address) -> UsageStatsView {
+        let stats = Self::get_usage_stats(env, owner, delegate);
+
+        let average_spent_bps = if stats.total_spends == 0 {
+            0
+        } else {
+            let total_spent_u = if stats.total_spent < 0 {
+                0i128
+            } else {
+                stats.total_spent
+            };
+            total_spent_u
+                .saturating_mul(10_000)
+                .checked_div(stats.total_spends as i128)
+                .unwrap_or(0) as u64
+        };
+
+        UsageStatsView {
+            spend_count: stats.total_spends,
+            total_spent: stats.total_spent,
+            average_spent_bps,
+            last_spend_ledger: if stats.total_spends == 0 {
+                None
+            } else {
+                Some(stats.last_spend_ledger)
+            },
+        }
     }
 
     /// Returns the total spent amount and the ledger sequence of the most
