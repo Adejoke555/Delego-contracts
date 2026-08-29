@@ -16,12 +16,17 @@ struct TestEnv {
     buyer: Address,
     seller: Address,
     agent: Address,
+    treasury: Address,
     token_contract_id: Address,
     escrow_contract_id: Address,
 }
 
 impl TestEnv {
     fn setup() -> Self {
+        Self::setup_with_fee_bps(0)
+    }
+
+    fn setup_with_fee_bps(fee_bps: u32) -> Self {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -41,7 +46,6 @@ impl TestEnv {
 
         let escrow_contract_id = env.register(EscrowContract, ());
         let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
-        let fee_bps = 0u32; // 0% for tests
         let min_amount = 100i128;
         let max_amount = 10000i128;
         escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
@@ -53,6 +57,7 @@ impl TestEnv {
             buyer,
             seller,
             agent,
+            treasury,
             token_contract_id,
             escrow_contract_id,
         }
@@ -674,6 +679,109 @@ fn test_release_eligibility_terminal_refund_blocks_release() {
     assert_eq!(re.reason, soroban_sdk::symbol_short!("refunded"));
 }
 
+// ── Release-condition gate for buyer self-release (issue #48) ─────────────
+
+#[test]
+fn test_require_release_condition_gates_buyer_release() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    assert!(escrow_client.set_require_release_condition(&t.admin, &escrow_id, &true));
+    assert!(escrow_client.get_require_release_condition(&escrow_id));
+
+    // Before timeout the escrow is eligible, so the buyer may release.
+    let result = escrow_client.partial_release(&escrow_id, &t.buyer, &400);
+    assert_eq!(result.released, 400);
+    assert_eq!(token_client.balance(&t.seller), 400);
+
+    // After the timeout, the eligibility gate blocks the buyer's release.
+    let record = escrow_client.get_escrow(&escrow_id);
+    t.env.ledger().set_sequence_number(record.timeout_ledger);
+    assert_eq!(
+        escrow_client.try_partial_release(&escrow_id, &t.buyer, &100),
+        Err(Ok(EscrowError::ConditionNotMet))
+    );
+    // The full `release` path is gated too.
+    assert_eq!(
+        escrow_client.try_release(&escrow_id, &t.buyer, &t.seller),
+        Err(Ok(EscrowError::ConditionNotMet))
+    );
+}
+
+#[test]
+fn test_require_release_condition_does_not_gate_admin() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    assert!(escrow_client.set_require_release_condition(&t.admin, &escrow_id, &true));
+
+    // Even after timeout, an admin-initiated release is not gated.
+    let record = escrow_client.get_escrow(&escrow_id);
+    t.env.ledger().set_sequence_number(record.timeout_ledger);
+    assert!(escrow_client.release(&escrow_id, &t.admin, &t.seller));
+    assert_eq!(token_client.balance(&t.seller), 1000);
+}
+
+#[test]
+fn test_require_release_condition_default_off_allows_buyer_release() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    // Default off: the flag reads false and the buyer can release even past timeout.
+    assert!(!escrow_client.get_require_release_condition(&escrow_id));
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    t.env.ledger().set_sequence_number(record.timeout_ledger);
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+    assert_eq!(token_client.balance(&t.seller), 1000);
+}
+
+#[test]
+fn test_require_release_condition_can_be_disabled() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    assert!(escrow_client.set_require_release_condition(&t.admin, &escrow_id, &true));
+    assert!(escrow_client.set_require_release_condition(&t.admin, &escrow_id, &false));
+    assert!(!escrow_client.get_require_release_condition(&escrow_id));
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    t.env.ledger().set_sequence_number(record.timeout_ledger);
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+    assert_eq!(token_client.balance(&t.seller), 1000);
+}
+
+#[test]
+fn test_set_require_release_condition_rejects_non_admin() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    assert_eq!(
+        escrow_client.try_set_require_release_condition(&t.agent, &escrow_id, &true),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_set_require_release_condition_not_found() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    assert_eq!(
+        escrow_client.try_set_require_release_condition(&t.admin, &999, &true),
+        Err(Ok(EscrowError::NotFound))
+    );
+}
+
 // ── EscrowReceipt getter tests (get_receipt) ─────────────────────────────
 
 /// Success path: receipt returned immediately after deposit (Funded state).
@@ -842,7 +950,7 @@ fn test_version_callable_without_auth() {
 
     let version = client.version();
     assert_eq!(version.name, symbol_short!("escrow"));
-    assert_eq!(version.semver, symbol_short!("0_1_0"));
+    assert_eq!(version.semver, symbol_short!("0_2_0"));
 }
 
 // ── Partial release tests ──────────────────────────────────────────────────
@@ -1670,10 +1778,43 @@ fn test_settle_from_pool_transfers_to_seller() {
     assert_eq!(record.status, EscrowStatus::Released);
     assert_eq!(record.released_amount, 1000);
 
-    // Pool balance is unaffected: the seller's payout is backed by this
-    // escrow's own now-settled deposit rather than draining the reserve.
+    // Pool balance is debited by the settled amount, mirroring the real
+    // token movement out of the reserve.
     let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
-    assert_eq!(pool.balance, 5000);
+    assert_eq!(pool.balance, 4000);
+}
+
+#[test]
+fn test_settle_from_pool_decrements_balance_and_blocks_overcommit() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let funder = Address::generate(&t.env);
+    let token_admin_client =
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token_contract_id);
+    token_admin_client.mint(&funder, &5000);
+    escrow_client.fund_pool(&funder, &t.token_contract_id, &5000);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    assert!(escrow_client.settle_from_pool(&escrow_id, &t.admin));
+
+    // Balance drops by exactly the settled amount.
+    assert_eq!(
+        escrow_client
+            .get_liquidity_pool(&t.token_contract_id)
+            .balance,
+        4000
+    );
+
+    // The remaining balance can still be withdrawn, but over-committing
+    // beyond it is rejected.
+    assert_eq!(
+        escrow_client.try_withdraw_from_pool(&t.admin, &t.token_contract_id, &4001),
+        Err(Ok(EscrowError::InsufficientPoolBalance))
+    );
+
+    let remaining_balance = escrow_client.withdraw_from_pool(&t.admin, &t.token_contract_id, &4000);
+    assert_eq!(remaining_balance, 0);
 }
 
 #[test]

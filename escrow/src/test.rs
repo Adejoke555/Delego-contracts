@@ -197,6 +197,10 @@ mod test {
         let key_metadata_1: soroban_sdk::Val = DataKey::EscrowMetadata(1u64).into_val(&env);
         let key_migration: soroban_sdk::Val = DataKey::MigrationFlag.into_val(&env);
         let key_fee_dist: soroban_sdk::Val = DataKey::FeeDistribution.into_val(&env);
+        let key_require_cond_0: soroban_sdk::Val =
+            DataKey::RequireReleaseCondition(0u64).into_val(&env);
+        let key_require_cond_1: soroban_sdk::Val =
+            DataKey::RequireReleaseCondition(1u64).into_val(&env);
 
         let all_keys: &[soroban_sdk::Val] = &[
             key_admin,
@@ -217,6 +221,8 @@ mod test {
             key_metadata_1,
             key_migration,
             key_fee_dist,
+            key_require_cond_0,
+            key_require_cond_1,
         ];
 
         // Assert every key is unique by comparing raw val representations
@@ -768,7 +774,7 @@ mod test {
 
         let v = client.check_version();
         assert_eq!(v.name, symbol_short!("escrow"));
-        assert_eq!(v.semver, symbol_short!("0_1_0"));
+        assert_eq!(v.semver, symbol_short!("0_2_0"));
         assert_eq!(v, client.version());
     }
 
@@ -1263,5 +1269,528 @@ mod test {
         let result = client.get_pending_admin();
         assert!(result.is_some());
         assert_eq!(result.unwrap(), new_admin);
+    }
+
+    // ─── Issue #32: DisputeVotedEvent Tests ─────────────────────────────────
+
+    /// Helper: set up an escrow in Disputed state with quorum config.
+    /// Returns (client, contract_id, escrow_id, arbiters).
+    fn setup_disputed_escrow(
+        env: &Env,
+        threshold: u32,
+    ) -> (EscrowContractClient<'_>, Address, u64, soroban_sdk::Vec<Address>) {
+        env.mock_all_auths();
+        let (client, admin, contract_id) = setup_client(env);
+
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token_admin = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        // Create 3 arbiters for quorum.
+        let arbiter_a = Address::generate(env);
+        let arbiter_b = Address::generate(env);
+        let arbiter_c = Address::generate(env);
+        let mut arbiters = soroban_sdk::Vec::new(env);
+        arbiters.push_back(arbiter_a);
+        arbiters.push_back(arbiter_b);
+        arbiters.push_back(arbiter_c);
+        client.set_quorum_config(&admin, &arbiters, &threshold);
+
+        let order_id = BytesN::from_array(env, &[11u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        client.dispute(&escrow_id, &buyer);
+
+        (client, contract_id, escrow_id, arbiters)
+    }
+
+    /// Emit DisputeVotedEvent under (escrow, "vote") after each vote mutation,
+    /// with live votes_for/threshold.
+    #[test]
+    fn test_vote_dispute_emits_dispute_voted_event() {
+        let env = Env::default();
+        let (client, contract_id, escrow_id, arbiters) =
+            setup_disputed_escrow(&env, 2); // threshold = 2
+        let arbiter = arbiters.get(0).unwrap();
+
+        client.vote_dispute(&escrow_id, &arbiter, &true);
+
+        let events = env.events().all();
+        let mut found = false;
+        for event in events.iter() {
+            let (c_id, topics, value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                let evt: crate::DisputeVotedEvent = value.try_into_val(&env).unwrap();
+                assert_eq!(evt.escrow_id, escrow_id);
+                assert_eq!(evt.arbiter, arbiter);
+                assert!(evt.release_to_seller);
+                assert_eq!(evt.votes_for, 1); // first vote for seller side
+                assert_eq!(evt.threshold, 2);
+                found = true;
+            }
+        }
+        assert!(found, "DisputeVotedEvent not found in events");
+    }
+
+    /// After a vote for buyer (release_to_seller = false), votes_for must stay 0.
+    #[test]
+    fn test_vote_dispute_emits_zero_votes_for_on_buyer_vote() {
+        let env = Env::default();
+        let (client, contract_id, escrow_id, arbiters) =
+            setup_disputed_escrow(&env, 2);
+        let arbiter = arbiters.get(0).unwrap();
+
+        client.vote_dispute(&escrow_id, &arbiter, &false); // vote for buyer
+
+        let events = env.events().all();
+        let mut found = false;
+        for event in events.iter() {
+            let (c_id, topics, value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                let evt: crate::DisputeVotedEvent = value.try_into_val(&env).unwrap();
+                assert_eq!(evt.escrow_id, escrow_id);
+                assert_eq!(evt.arbiter, arbiter);
+                assert!(!evt.release_to_seller);
+                assert_eq!(evt.votes_for, 0); // no votes for seller side
+                assert_eq!(evt.threshold, 2);
+                found = true;
+            }
+        }
+        assert!(found, "DisputeVotedEvent not found in events");
+    }
+
+    /// Quorum boundary: second seller-side vote should show votes_for = threshold.
+    #[test]
+    fn test_vote_dispute_quorum_boundary_emits_correct_tally() {
+        let env = Env::default();
+        let (client, contract_id, escrow_id, arbiters) =
+            setup_disputed_escrow(&env, 2); // threshold = 2
+
+        // First seller vote.
+        client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
+
+        // Second seller vote — reaches quorum.
+        client.vote_dispute(&escrow_id, &arbiters.get(1).unwrap(), &true);
+
+        // Find the LAST DisputeVotedEvent — it should show votes_for = 2.
+        let events = env.events().all();
+        let mut last_evt: Option<crate::DisputeVotedEvent> = None;
+        for event in events.iter() {
+            let (c_id, topics, value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                last_evt = Some(value.try_into_val(&env).unwrap());
+            }
+        }
+        let evt = last_evt.expect("DisputeVotedEvent not found in events");
+        assert_eq!(evt.escrow_id, escrow_id);
+        assert_eq!(evt.arbiter, arbiters.get(1).unwrap());
+        assert!(evt.release_to_seller);
+        assert_eq!(evt.votes_for, 2); // quorum reached
+        assert_eq!(evt.threshold, 2);
+    }
+
+    /// Each vote emits exactly one event (no duplicates, no missing).
+    #[test]
+    fn test_vote_dispute_emits_exactly_one_event_per_vote() {
+        let env = Env::default();
+        let (client, contract_id, escrow_id, arbiters) =
+            setup_disputed_escrow(&env, 3); // threshold = 3
+
+        // Vote 1: verify exactly one DisputeVotedEvent.
+        client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
+        let mut count = 0u32;
+        for event in env.events().all().iter() {
+            let (c_id, topics, _value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1, "first vote should emit exactly one DisputeVotedEvent");
+
+        // Vote 2: verify exactly one more DisputeVotedEvent.
+        client.vote_dispute(&escrow_id, &arbiters.get(1).unwrap(), &true);
+        count = 0;
+        for event in env.events().all().iter() {
+            let (c_id, topics, _value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1, "second vote should emit exactly one DisputeVotedEvent");
+
+        // Vote 3: verify exactly one more.
+        client.vote_dispute(&escrow_id, &arbiters.get(2).unwrap(), &false);
+        count = 0;
+        for event in env.events().all().iter() {
+            let (c_id, topics, _value) = event;
+            if c_id != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("vote") {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1, "third vote should emit exactly one DisputeVotedEvent");
+    }
+
+    // ─── Issue #34: Monotonic YieldView Tests ────────────────────────────────
+
+    #[test]
+    fn test_get_accrued_yield_returns_yield_view() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[60u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let lending = Address::generate(&env);
+        let apr_bps = 500u32; // 5% APR
+        client.set_yield_config(&admin, &escrow_id, &lending, &apr_bps);
+
+        let view = client.get_accrued_yield(&escrow_id);
+        assert_eq!(view.escrow_id, escrow_id);
+        assert_eq!(view.principal, 1_000i128);
+        assert_eq!(view.apy_bps, 500);
+        assert_eq!(view.snapshot_ledger, env.ledger().sequence());
+        // accrued may be 0 at ledger 0 since created_at == timestamp
+        assert!(view.accrued >= 0);
+    }
+
+    #[test]
+    fn test_get_accrued_yield_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+
+        let res = client.try_get_accrued_yield(&999u64);
+        assert_eq!(res, Err(Ok(EscrowError::NotFound)));
+    }
+
+    #[test]
+    fn test_get_accrued_yield_no_config_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[61u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+        // No yield config set.
+
+        let view = client.get_accrued_yield(&escrow_id);
+        assert_eq!(view.escrow_id, escrow_id);
+        assert_eq!(view.principal, 1_000i128);
+        assert_eq!(view.apy_bps, 0);
+        assert_eq!(view.held_seconds, 0);
+        assert_eq!(view.accrued, 0);
+    }
+
+    /// Same-block reads must be identical.
+    #[test]
+    fn test_get_accrued_yield_same_block_reads_identical() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[62u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let lending = Address::generate(&env);
+        client.set_yield_config(&admin, &escrow_id, &lending, &500u32);
+
+        // Two reads within the same ledger must be identical.
+        let view_a = client.get_accrued_yield(&escrow_id);
+        let view_b = client.get_accrued_yield(&escrow_id);
+
+        assert_eq!(view_a, view_b, "same-block reads must be identical");
+        assert_eq!(view_a.snapshot_ledger, view_b.snapshot_ledger);
+        assert_eq!(view_a.held_seconds, view_b.held_seconds);
+        assert_eq!(view_a.accrued, view_b.accrued);
+    }
+
+    /// Cross-block reads must be monotonically non-decreasing.
+    #[test]
+    fn test_get_accrued_yield_cross_block_monotonic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[63u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let lending = Address::generate(&env);
+        client.set_yield_config(&admin, &escrow_id, &lending, &500u32);
+
+        let view_before = client.get_accrued_yield(&escrow_id);
+
+        // Advance 100 ledgers.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = li.sequence_number + 100;
+        });
+
+        let view_after = client.get_accrued_yield(&escrow_id);
+
+        assert!(
+            view_after.held_seconds >= view_before.held_seconds,
+            "held_seconds must be monotonically non-decreasing"
+        );
+        assert!(
+            view_after.accrued >= view_before.accrued,
+            "accrued yield must be monotonically non-decreasing"
+        );
+        assert!(
+            view_after.snapshot_ledger > view_before.snapshot_ledger,
+            "snapshot_ledger must advance"
+        );
+    }
+
+    // ─── Issue #33: Partial-release yield test ────────────────────────────────
+
+    /// After a partial release, yield must be computed on the remaining
+    /// principal, not the original amount.
+    #[test]
+    fn test_get_accrued_yield_scales_by_remaining_principal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[70u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let lending = Address::generate(&env);
+        client.set_yield_config(&admin, &escrow_id, &lending, &1_000u32); // 10% APR
+
+        // Advance 1 year so yield is non-trivial.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1000;
+            li.timestamp = 31_536_000; // ~1 year in seconds
+        });
+
+        // Before partial release: yield on full 1000 principal.
+        let before = client.get_accrued_yield(&escrow_id);
+        assert_eq!(before.principal, 1_000i128);
+        assert!(before.accrued > 0, "yield should be non-zero");
+
+        // Partial release: 500 of 1000.
+        client.partial_release(&escrow_id, &buyer, &500);
+
+        // After partial release: yield must be computed on remaining 500.
+        let after = client.get_accrued_yield(&escrow_id);
+        assert_eq!(after.principal, 500i128);
+        // accrued should be roughly half of before (same time, half principal).
+        assert!(
+            after.accrued < before.accrued,
+            "yield after partial release must be less than before ({} < {})",
+            after.accrued,
+            before.accrued
+        );
+        assert!(
+            after.accrued > 0,
+            "yield should still be non-zero after partial release"
+        );
+    }
+
+    // ─── Issue #35: updated_at lifecycle tests ──────────────────────────────
+
+    /// updated_at must be set to the ledger timestamp on creation.
+    #[test]
+    fn test_updated_at_set_on_creation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[80u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(record.updated_at, record.created_at);
+    }
+
+    /// updated_at must advance when escrow status changes (fund → dispute).
+    #[test]
+    fn test_updated_at_advances_on_dispute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[81u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let after_deposit = client.get_escrow(&escrow_id);
+        assert_eq!(after_deposit.updated_at, after_deposit.created_at);
+
+        // Advance ledger and dispute.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 50;
+        });
+
+        client.dispute(&escrow_id, &buyer);
+
+        let after_dispute = client.get_escrow(&escrow_id);
+        assert!(
+            after_dispute.updated_at >= after_deposit.updated_at,
+            "updated_at must advance after dispute"
+        );
+    }
+
+    /// updated_at must advance across a full lifecycle: deposit → dispute → resolve.
+    #[test]
+    fn test_updated_at_advances_full_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[82u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+
+        let r1 = client.get_escrow(&escrow_id);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 50;
+        });
+        client.dispute(&escrow_id, &buyer);
+        let r2 = client.get_escrow(&escrow_id);
+        assert!(r2.updated_at >= r1.updated_at);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 100;
+        });
+        client.resolve_dispute(&escrow_id, &admin, &true);
+        let r3 = client.get_escrow(&escrow_id);
+        assert!(
+            r3.updated_at >= r2.updated_at,
+            "updated_at must advance through resolve"
+        );
     }
 }

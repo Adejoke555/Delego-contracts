@@ -71,6 +71,7 @@ pub struct EscrowRecord {
     pub status: EscrowStatus,
     pub order_id: BytesN<32>,
     pub created_at: u64,
+    pub updated_at: u64,
     pub timeout_ledger: u32,
 }
 
@@ -189,6 +190,20 @@ pub struct EscrowResolvedEvent {
     pub resolved_by: Address,
 }
 
+/// Emitted on each arbiter vote during dispute resolution (#32).
+///
+/// Reports live tallies so indexers and UIs can track quorum progress
+/// on-chain without replaying storage diffs.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DisputeVotedEvent {
+    pub escrow_id: u64,
+    pub arbiter: Address,
+    pub release_to_seller: bool,
+    pub votes_for: u32,
+    pub threshold: u32,
+}
+
 /// Emitted when escrowed funds are split among multiple recipients (#321).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -299,6 +314,19 @@ pub struct TreasuryShare {
     pub treasury: Address,
     /// Share in basis points (e.g., 250 = 2.5%)
     pub bps: u32,
+}
+
+/// Net seller payout plus the platform fee deducted for a release amount,
+/// as computed by `compute_payout` (issue #27).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleasePayout {
+    /// Amount the seller actually receives after the fee is deducted.
+    pub seller_net: i128,
+    /// Total fee charged across all treasuries.
+    pub fee: i128,
+    /// Primary treasury that receives the fee (from `FeeConfig`).
+    pub treasury: Address,
 }
 
 #[contracttype]
@@ -457,6 +485,9 @@ pub enum DataKey {
     EscrowYieldConfig(u64),
     /// Release condition for an escrow.
     ReleaseCondition(u64),
+    /// Admin flag: when `true`, buyer-originated releases on the escrow must
+    /// pass `get_release_eligibility` (issue #48).
+    RequireReleaseCondition(u64),
 }
 
 #[contracterror]
@@ -637,14 +668,22 @@ pub struct EscrowSnapshot {
     pub release_eligible: bool,
 }
 
-/// Read-only view of the yield an escrow has accrued so far, returned by
-/// `get_accrued_yield` (issue #331).
+/// Monotonic yield snapshot returned by [`EscrowContract::get_accrued_yield`]
+/// (issue #34).
+///
+/// All inputs needed for display are included so polling UIs cannot observe
+/// decreasing yield.  `snapshot_ledger` anchors the read to a block-stable
+/// point; `held_seconds` is computed from `created_at` to that ledger's
+/// timestamp, making the result deterministic within a single ledger close.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowYieldView {
+pub struct YieldView {
     pub escrow_id: u64,
-    pub accrued_yield: i128,
-    pub apr_bps: u32,
+    pub principal: i128,
+    pub apy_bps: u32,
+    pub held_seconds: u64,
+    pub accrued: i128,
+    pub snapshot_ledger: u32,
 }
 
 /// Compact read-only escrow summary for API/indexer consumers (issue #90).
@@ -739,7 +778,7 @@ impl EscrowContract {
     pub fn version(_env: Env) -> ContractVersion {
         ContractVersion {
             name: symbol_short!("escrow"),
-            semver: symbol_short!("0_1_0"),
+            semver: symbol_short!("0_2_0"),
         }
     }
 
@@ -927,10 +966,27 @@ impl EscrowContract {
         }
 
         votes.push_back(DisputeVote {
-            arbiter,
+            arbiter: arbiter.clone(),
             release_to_seller,
         });
         env.storage().persistent().set(&votes_key, &votes);
+
+        // Compute live tallies so the event reflects the state *after* this vote.
+        let votes_for = votes
+            .iter()
+            .filter(|v| v.release_to_seller)
+            .count() as u32;
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("vote")),
+            DisputeVotedEvent {
+                escrow_id,
+                arbiter,
+                release_to_seller,
+                votes_for,
+                threshold: quorum_config.threshold,
+            },
+        );
 
         Ok(true)
     }
@@ -997,13 +1053,12 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
-            let fee = Self::distribute_fee(&env, &token_client, record.amount)?;
-            let seller_amount = record.amount - fee;
-
+            let payout = Self::compute_payout(&env, record.amount)?;
+            Self::distribute_fee(&env, &token_client, record.amount)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
-                &seller_amount,
+                &payout.seller_net,
             );
             record.status = EscrowStatus::Released;
         } else {
@@ -1015,6 +1070,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Refunded;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -1098,6 +1154,7 @@ impl EscrowContract {
         let previous_timeout_ledger = record.timeout_ledger;
         let new_timeout_ledger = previous_timeout_ledger.saturating_add(extension_ledgers);
         record.timeout_ledger = new_timeout_ledger;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().remove(&votes_key);
 
@@ -1221,27 +1278,67 @@ impl EscrowContract {
             .get(&DataKey::FeeDistribution)
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
 
-        if !shares.is_empty() {
-            let mut total_fee: i128 = 0;
+        let total_fee = Self::compute_fee_amount(env, amount)?;
+        if total_fee == 0 {
+            return Ok(0);
+        }
+
+        if shares.is_empty() {
+            let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+            token_client.transfer(
+                &env.current_contract_address(),
+                &fee_config.treasury,
+                &total_fee,
+            );
+        } else {
             for share in shares.iter() {
                 let bps = share.bps as i128;
                 let fee = (amount / 10_000i128) * bps + ((amount % 10_000i128) * bps) / 10_000i128;
                 if fee > 0 {
                     token_client.transfer(&env.current_contract_address(), &share.treasury, &fee);
-                    total_fee += fee;
                 }
+            }
+        }
+        Ok(total_fee)
+    }
+
+    /// Computes the total release fee (in tokens) for `amount`, splitting it
+    /// across the configured multi-treasury distribution when one is set,
+    /// falling back to the single-treasury `FeeConfig` otherwise. Never
+    /// transfers tokens and never panics on a missing config: returns
+    /// `FeeConfigNotSet` when no config exists.
+    fn compute_fee_amount(env: &Env, amount: i128) -> Result<i128, EscrowError> {
+        let shares: soroban_sdk::Vec<TreasuryShare> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeDistribution)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+        if !shares.is_empty() {
+            let mut total_fee: i128 = 0;
+            for share in shares.iter() {
+                let bps = share.bps as i128;
+                total_fee +=
+                    (amount / 10_000i128) * bps + ((amount % 10_000i128) * bps) / 10_000i128;
             }
             Ok(total_fee)
         } else {
             let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
             let fee_bps = fee_config.fee_bps as i128;
-            let fee =
-                (amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128;
-            if fee > 0 {
-                token_client.transfer(&env.current_contract_address(), &fee_config.treasury, &fee);
-            }
-            Ok(fee)
+            Ok((amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128)
         }
+    }
+
+    /// Computes the net seller payout and platform fee for `amount` (issue #27).
+    /// Pure calculation — see `distribute_fee` for the transfer side.
+    fn compute_payout(env: &Env, amount: i128) -> Result<ReleasePayout, EscrowError> {
+        let fee = Self::compute_fee_amount(env, amount)?;
+        let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+        Ok(ReleasePayout {
+            seller_net: amount - fee,
+            fee,
+            treasury: fee_config.treasury,
+        })
     }
 
     /// Add a token to the escrow whitelist. Admin-only.
@@ -1415,11 +1512,9 @@ impl EscrowContract {
     /// shared liquidity pool for that escrow's token, instead of going
     /// through the ordinary buyer/admin-triggered `release` flow. Admin-only.
     ///
-    /// The pool's tracked balance is left unchanged by a settlement: the
-    /// amount it fronts to the seller is immediately backed by the settling
-    /// escrow's own already-deposited funds, which remain held by this
-    /// contract. `pool.balance` therefore always reflects real, currently
-    /// unencumbered liquidity available to back further instant settlements.
+    /// The settled amount is debited from the pool's tracked balance so that
+    /// `pool.balance` always reflects real, currently unencumbered liquidity
+    /// and a later `withdraw_from_pool` cannot over-commit the same tokens.
     pub fn settle_from_pool(
         env: Env,
         escrow_id: u64,
@@ -1446,7 +1541,7 @@ impl EscrowContract {
         }
 
         let pool_key = DataKey::LiquidityPool(record.token.clone());
-        let pool: LiquidityPool = env
+        let mut pool: LiquidityPool = env
             .storage()
             .instance()
             .get(&pool_key)
@@ -1458,8 +1553,15 @@ impl EscrowContract {
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         token_client.transfer(&env.current_contract_address(), &record.seller, &remaining);
 
+        pool.balance = pool
+            .balance
+            .checked_sub(remaining)
+            .ok_or(EscrowError::InsufficientPoolBalance)?;
+        env.storage().instance().set(&pool_key, &pool);
+
         record.released_amount = record.amount;
         record.status = EscrowStatus::Released;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -1594,6 +1696,7 @@ impl EscrowContract {
             status: EscrowStatus::Created,
             order_id: order_id.clone(),
             created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
             timeout_ledger,
         };
 
@@ -1666,6 +1769,7 @@ impl EscrowContract {
         token_client.transfer(&buyer, &env.current_contract_address(), &record.amount);
 
         record.status = EscrowStatus::Funded;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         Ok(true)
@@ -1704,6 +1808,7 @@ impl EscrowContract {
         }
 
         record.status = EscrowStatus::Cancelled;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -1788,6 +1893,7 @@ impl EscrowContract {
         token_client.transfer(&buyer, &env.current_contract_address(), &amount);
 
         record.status = EscrowStatus::Funded;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         Ok(escrow_id)
@@ -1893,6 +1999,7 @@ impl EscrowContract {
     /// Release a partial amount to the seller.
     /// `release_amount` must be <= (record.amount - record.released_amount).
     /// If release_amount equals the remaining balance, set status to Released.
+    /// The platform fee is deducted from `release_amount` (issue #27).
     pub fn partial_release(
         env: Env,
         escrow_id: u64,
@@ -1929,12 +2036,31 @@ impl EscrowContract {
         }
         Self::validate_release_status(&record)?;
 
+        // When the admin has required it, buyer-originated releases must pass
+        // the release-eligibility gate (issue #48). Admins are not gated.
+        if caller == record.buyer
+            && env
+                .storage()
+                .persistent()
+                .get(&DataKey::RequireReleaseCondition(escrow_id))
+                .unwrap_or(false)
+            && Self::release_block_reason(env.clone(), &record).is_some()
+        {
+            return Err(EscrowError::ConditionNotMet);
+        }
+
         Self::execute_release(&env, escrow_id, &key, record, caller, release_amount)
     }
 
     /// Shared release logic used by both `partial_release` and
     /// `evaluate_and_release`. Callers are responsible for their own
     /// authorization checks before invoking this.
+    ///
+    /// The platform fee (per `FeeConfig` or the multi-treasury
+    /// `FeeDistribution`) is deducted from `release_amount` and transferred to
+    /// the treasury(ies); the seller receives the remainder (issue #27).
+    /// `released_amount` tracks the full escrow-amount released, not the net
+    /// seller payout.
     fn execute_release(
         env: &Env,
         escrow_id: u64,
@@ -1953,10 +2079,13 @@ impl EscrowContract {
         }
 
         let token_client = soroban_sdk::token::Client::new(env, &record.token);
+
+        let payout = Self::compute_payout(env, release_amount)?;
+        Self::distribute_fee(env, &token_client, release_amount)?;
         token_client.transfer(
             &env.current_contract_address(),
             &record.seller,
-            &release_amount,
+            &payout.seller_net,
         );
 
         record.released_amount += release_amount;
@@ -1966,6 +2095,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Released;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(key, &record);
 
         env.events().publish(
@@ -2005,6 +2135,7 @@ impl EscrowContract {
     }
 
     /// Release escrowed funds to the seller. Only the buyer or admin may call.
+    /// The platform fee is deducted from the released amount (issue #27).
     pub fn release(
         env: Env,
         escrow_id: u64,
@@ -2112,6 +2243,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Refunded;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -2195,7 +2327,8 @@ impl EscrowContract {
     }
 
     /// Query the configured oracle and release the full remaining balance to the
-    /// seller if the condition it reports is met (issue #339).
+    /// seller if the condition it reports is met (issue #339). The seller
+    /// receives the remaining balance minus the platform fee (issue #27).
     ///
     /// Any caller may trigger evaluation once a condition has been configured via
     /// `set_release_condition` — authorization to move funds comes from the
@@ -2266,6 +2399,7 @@ impl EscrowContract {
         }
 
         record.status = EscrowStatus::Disputed;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -2304,13 +2438,12 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
-            let fee = Self::distribute_fee(&env, &token_client, record.amount)?;
-            let seller_amount = record.amount - fee;
-
+            let payout = Self::compute_payout(&env, record.amount)?;
+            Self::distribute_fee(&env, &token_client, record.amount)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
-                &seller_amount,
+                &payout.seller_net,
             );
             record.status = EscrowStatus::Released;
         } else {
@@ -2322,6 +2455,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Refunded;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -2511,13 +2645,22 @@ impl EscrowContract {
         Ok(true)
     }
 
-    /// Read-only view of the yield an escrow has accrued so far, based on
-    /// the time it has been held (issue #331). Returns zero accrued yield
-    /// when no `YieldConfig` is set. Never mutates storage.
+    /// Monotonic yield snapshot for an escrow (issue #34).
+    ///
+    /// Returns a [`YieldView`] containing every input needed to compute
+    /// display-relevant yield numbers.  `snapshot_ledger` anchors the read
+    /// to the current ledger, `held_seconds` is derived from
+    /// `created_at` to the snapshot ledger's close time, and `accrued` is
+    /// the yield at that frozen point.  Two calls within the same ledger
+    /// always return identical results; calls in different ledgers produce
+    /// monotonically increasing `held_seconds` and `accrued`.
+    ///
+    /// Returns zero yield fields when no `YieldConfig` is set.
+    /// Never mutates storage.
     ///
     /// # Errors
     /// Returns [`EscrowError::NotFound`] when no escrow exists for `escrow_id`.
-    pub fn get_accrued_yield(env: Env, escrow_id: u64) -> Result<EscrowYieldView, EscrowError> {
+    pub fn get_accrued_yield(env: Env, escrow_id: u64) -> Result<YieldView, EscrowError> {
         let key = DataKey::Escrow(escrow_id);
         let record: EscrowRecord = env
             .storage()
@@ -2529,13 +2672,20 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&DataKey::EscrowYieldConfig(escrow_id));
-        let apr_bps = yield_config.as_ref().map(|c| c.apr_bps).unwrap_or(0);
-        let (accrued_yield, _) = Self::compute_yield(&record, yield_config.as_ref(), &env);
+        let apy_bps = yield_config.as_ref().map(|c| c.apr_bps).unwrap_or(0);
+        let snapshot_ledger = env.ledger().sequence();
+        let (accrued, held_seconds) =
+            Self::compute_yield(&record, yield_config.as_ref(), &env);
 
-        Ok(EscrowYieldView {
+        let remaining = record.amount - record.released_amount;
+
+        Ok(YieldView {
             escrow_id,
-            accrued_yield,
-            apr_bps,
+            principal: remaining,
+            apy_bps,
+            held_seconds,
+            accrued,
+            snapshot_ledger,
         })
     }
 
@@ -2964,8 +3114,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Computes yield accrued on an escrow's principal for the time it has
-    /// been held, based on the given `YieldConfig` APR. Returns
+    /// Computes yield accrued on an escrow's remaining principal for the time
+    /// it has been held, based on the given `YieldConfig` APR.  The principal
+    /// is `record.amount - record.released_amount` so partially released
+    /// escrows report honest yield (issue #33).  Returns
     /// `(yield_amount, held_seconds)`; `(0, 0)` when no yield config is set.
     fn compute_yield(
         record: &EscrowRecord,
@@ -2975,7 +3127,8 @@ impl EscrowContract {
         match yield_config {
             Some(cfg) => {
                 let held_seconds = env.ledger().timestamp().saturating_sub(record.created_at);
-                let yield_amount = (record.amount * cfg.apr_bps as i128 * held_seconds as i128)
+                let remaining = record.amount - record.released_amount;
+                let yield_amount = (remaining * cfg.apr_bps as i128 * held_seconds as i128)
                     / (10_000i128 * SECONDS_PER_YEAR);
                 (yield_amount, held_seconds)
             }
@@ -3069,6 +3222,7 @@ impl EscrowContract {
         if new_remaining == 0 {
             record.status = EscrowStatus::Released;
         }
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -3124,6 +3278,7 @@ impl EscrowContract {
 
         let old_timeout = record.timeout_ledger;
         record.timeout_ledger = new_timeout_ledger;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -3192,6 +3347,46 @@ impl EscrowContract {
             .persistent()
             .remove(&DataKey::ReleaseCondition(escrow_id));
         Ok(())
+    }
+
+    /// Enable or disable the release-condition gate for buyer-originated
+    /// releases on an escrow (issue #48). Admin-only.
+    ///
+    /// When `require` is `true`, buyer-originated `partial_release`/`release`
+    /// on this escrow are blocked unless `get_release_eligibility` returns
+    /// eligible. The default is `false` for backward compatibility.
+    pub fn set_require_release_condition(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        require: bool,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+        if !Self::is_admin(env.clone(), caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        check_not_terminal(&record)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RequireReleaseCondition(escrow_id), &require);
+        Ok(true)
+    }
+
+    /// Read-only getter for whether buyer-originated releases on an escrow are
+    /// gated on the release condition. Defaults to `false` when unset.
+    pub fn get_require_release_condition(env: Env, escrow_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RequireReleaseCondition(escrow_id))
+            .unwrap_or(false)
     }
 
     // ── Ticket 2: get_yield_config ────────────────────────────────────────────
