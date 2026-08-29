@@ -329,6 +329,17 @@ pub struct PermissionExpiryUpdatedEvent {
     pub new_expiry: u32,
 }
 
+/// Emitted by `renew_permission` when a renewal's requested extension would
+/// overflow `u32` and is instead capped at `u32::MAX`, so callers get an
+/// explicit signal rather than a silently saturated expiry.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PermissionExpiryCappedEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    pub capped_at: u32,
+}
+
 /// A single entry in the on-chain audit log for a (owner, delegate) pair.
 /// Stored as a `Vec<AuditLogEntry>` under `DataKey::AuditLog(owner, delegate)`.
 #[contracttype]
@@ -856,8 +867,22 @@ impl PermissionsContract {
             // Store old expiry for audit log
             let old_expires = record.expires_at_ledger;
 
-            // Extend TTL
-            record.expires_at_ledger = record.expires_at_ledger.saturating_add(additional_ledgers);
+            // Extend TTL, explicitly signalling rather than silently
+            // saturating if the extension would overflow u32.
+            record.expires_at_ledger = match old_expires.checked_add(additional_ledgers) {
+                Some(new_expiry) => new_expiry,
+                None => {
+                    env.events().publish(
+                        (symbol_short!("perm"), symbol_short!("exp_cap")),
+                        PermissionExpiryCappedEvent {
+                            owner: owner.clone(),
+                            delegate: delegate.clone(),
+                            capped_at: u32::MAX,
+                        },
+                    );
+                    u32::MAX
+                }
+            };
 
             // Persist the updated record (spent counter preserved)
             env.storage().persistent().set(&key, &record);
@@ -997,6 +1022,53 @@ impl PermissionsContract {
         }
     }
 
+    /// Walks the `parent_owner`/`parent_delegate` chain of a permission
+    /// record, returning the minimum `expires_at_ledger` across the record
+    /// itself and every ancestor. A child permission is only ever
+    /// spendable up to the earliest expiry in its lineage, so a parent
+    /// that expires naturally (by ledger, without an explicit `revoke`)
+    /// also caps every descendant's effective liveness — closing the gap
+    /// where only explicit revocation cascaded but natural expiry did not.
+    ///
+    /// Bounded to 32 hops to guard against a pathological/cyclic parent
+    /// chain; real chains are expected to be a handful of levels deep.
+    fn effective_expiry(env: &Env, record: &PermissionRecord) -> u32 {
+        let mut min_expiry = record.expires_at_ledger;
+        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
+            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+            _ => None,
+        };
+
+        let mut hops = 0u32;
+        while let Some((p_owner, p_delegate)) = next_parent {
+            if hops >= 32 {
+                break;
+            }
+            hops += 1;
+
+            let parent_key = DataKey::Permission(p_owner, p_delegate);
+            let parent_record: PermissionRecord = match env.storage().persistent().get(&parent_key)
+            {
+                Some(r) => r,
+                None => break,
+            };
+
+            if parent_record.expires_at_ledger < min_expiry {
+                min_expiry = parent_record.expires_at_ledger;
+            }
+
+            next_parent = match (
+                parent_record.parent_owner.clone(),
+                parent_record.parent_delegate.clone(),
+            ) {
+                (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+                _ => None,
+            };
+        }
+
+        min_expiry
+    }
+
     pub fn can_spend(
         env: Env,
         owner: Address,
@@ -1017,7 +1089,11 @@ impl PermissionsContract {
             PermissionStatus::Revoked => return Err(PermissionError::Unauthorized),
         }
 
-        if env.ledger().sequence() >= record.expires_at_ledger {
+        // Bound liveness by the full ancestor chain: a parent that expired
+        // naturally (by ledger, without an explicit revoke) also expires
+        // this child, even though this record's own `expires_at_ledger`
+        // hasn't been reached yet.
+        if env.ledger().sequence() >= Self::effective_expiry(&env, &record) {
             return Err(PermissionError::Expired);
         }
 
@@ -1288,6 +1364,17 @@ impl PermissionsContract {
         }
         if threshold == 0 || threshold > owners.len() {
             return Err(PermissionError::InvalidParam);
+        }
+
+        // Reject self-delegation unless explicitly allowed, mirroring the
+        // guard already applied on `grant` and `grant_child`.
+        let allow_self: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowSelfDelegation)
+            .unwrap_or(false);
+        if !allow_self && owners.contains(&delegate) {
+            return Err(PermissionError::SelfDelegationNotAllowed);
         }
         if limit_per_tx <= 0 || limit_total < limit_per_tx {
             return Err(PermissionError::InvalidParam);
@@ -1973,6 +2060,47 @@ impl PermissionsContract {
         Ok(true)
     }
 
+    /// Transitions a permission whose TTL has elapsed from `Active` to
+    /// `Expired`, making the `PermissionStatus::Expired` variant reachable
+    /// in stored state rather than only computed on the fly. `is_active`,
+    /// `can_spend`, and `get_delegate_status` already treat an
+    /// on-the-fly-expired `Active` record as not spendable, so this is a
+    /// bookkeeping transition rather than a behavior change for those
+    /// reads — it lets `get_permission`/`get_multi_permission` callers see
+    /// `Expired` in the stored `status` field without recomputing it
+    /// themselves. Returns `Ok(true)` if a transition occurred, `Ok(false)`
+    /// if the record was not eligible (already non-`Active`, or not yet
+    /// past its expiry).
+    pub fn sweep_expired(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        caller: Address,
+    ) -> Result<bool, PermissionError> {
+        caller.require_auth();
+
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let mut record: PermissionRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PermissionError::PermissionNotFound)?;
+
+        if record.status != PermissionStatus::Active {
+            return Ok(false);
+        }
+        if env.ledger().sequence() < record.expires_at_ledger {
+            return Ok(false);
+        }
+
+        record.status = PermissionStatus::Expired;
+        env.storage().persistent().set(&key, &record);
+
+        Self::append_audit_log(&env, &owner, &delegate, caller, symbol_short!("expired"));
+
+        Ok(true)
+    }
+
     /// Configure the minimum number of ledgers that must elapse between successive
     /// spends for any delegation pair (#324). Admin-only.
     ///
@@ -2329,7 +2457,7 @@ impl PermissionsContract {
         if record.status != PermissionStatus::Active {
             return false;
         }
-        env.ledger().sequence() < record.expires_at_ledger
+        env.ledger().sequence() < Self::effective_expiry(&env, &record)
     }
 
     /// Returns the audit log for a (owner, delegate) pair, or an empty vec
